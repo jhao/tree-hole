@@ -12,3 +12,12 @@ export interface Message {
   timestamp: number;
   classification?: Classification;
 }
+
+export interface TreeHole {
+  id: string;
+  name: string;
+  passwordHash: string; // Storing password directly for simplicity in local-only app
+  messages: Message[];
+  position: { top: string; left: string; }; // For visual layout
+  createdAt: number;
+}
