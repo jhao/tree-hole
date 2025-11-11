@@ -3,10 +3,10 @@ const MAX_STORAGE_BYTES = 5 * 1024 * 1024;
 const STORAGE_WARNING_THRESHOLD = 0.9;
 
 const initialHolePositions = [
-  { top: '15%', left: '50%' }, { top: '25%', left: '30%' }, { top: '28%', left: '70%' },
-  { top: '40%', left: '45%' }, { top: '50%', left: '65%' }, { top: '62%', left: '35%' },
-  { top: '75%', left: '55%' }, { top: '88%', left: '40%' }, { top: '105%', left: '60%' },
-  { top: '120%', left: '30%' }, { top: '135%', left: '50%' }, { top: '150%', left: '70%' }
+  { top: '14%', left: '50%' }, { top: '24%', left: '45%' }, { top: '30%', left: '55%' },
+  { top: '40%', left: '48%' }, { top: '50%', left: '52%' }, { top: '62%', left: '44%' },
+  { top: '72%', left: '56%' }, { top: '84%', left: '47%' }, { top: '96%', left: '53%' },
+  { top: '110%', left: '46%' }, { top: '124%', left: '50%' }, { top: '140%', left: '54%' }
 ];
 
 const comfortingPhrases = [
@@ -341,57 +341,82 @@ function handlePinDelete() {
 
 function renderPasswordModal() {
   const modal = state.passwordModal;
-  const existing = document.getElementById('password-modal');
-  if (existing) {
-    existing.remove();
+  let container = document.getElementById('password-modal');
+
+  if (!modal || !modal.open) {
+    if (container) {
+      container.remove();
+    }
+    return;
   }
-  if (!modal || !modal.open) return;
 
-  const container = document.createElement('div');
-  container.id = 'password-modal';
-  container.className = 'modal-overlay';
-  container.innerHTML = `
-    <div class="modal-card" role="dialog" aria-modal="true">
-      <h2 class="modal-title">${modal.mode === 'setup'
-        ? (modal.step === 1 ? '设置4位密码' : '请再次输入以确认')
-        : '输入密码'}</h2>
-      <p class="modal-subtitle">${modal.mode === 'setup'
-        ? '为这个树洞创建一个密码。'
-        : '请输入密码以进入。'}</p>
-      <div class="pin-dots">
-        ${[...Array(4)].map((_, index) => {
-          const filled = modal.step === 2 ? modal.confirmPin.length > index : modal.pin.length > index;
-          return `<div class="pin-dot${filled ? ' filled' : ''}"></div>`;
-        }).join('')}
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'password-modal';
+    container.className = 'modal-overlay';
+    container.innerHTML = `
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <h2 class="modal-title" data-role="title"></h2>
+        <p class="modal-subtitle" data-role="subtitle"></p>
+        <div class="pin-dots" data-role="dots">
+          ${[...Array(4)].map((_, index) => `<div class="pin-dot" data-pin-dot="${index}"></div>`).join('')}
+        </div>
+        <div class="error-text" data-role="error"></div>
+        <div class="keypad" data-role="keypad">
+          ${['1','2','3','4','5','6','7','8','9','','0','⌫'].map(key => {
+            if (key === '') {
+              return '<span></span>';
+            }
+            return `<button type="button" data-key="${key}">${key}</button>`;
+          }).join('')}
+        </div>
       </div>
-      <div class="error-text">${modal.error || ''}</div>
-      <div class="keypad">
-        ${['1','2','3','4','5','6','7','8','9','','0','⌫'].map(key => {
-          if (key === '') {
-            return '<span></span>';
-          }
-          return `<button type="button" data-key="${key}">${key}</button>`;
-        }).join('')}
-      </div>
-    </div>
-  `;
+    `;
 
-  container.addEventListener('click', (event) => {
-    if (event.target === container) {
-      closePasswordModal();
-    }
-  });
+    container.addEventListener('click', (event) => {
+      if (event.target === container) {
+        closePasswordModal();
+      }
+    });
 
-  container.querySelectorAll('button[data-key]').forEach(button => {
-    const value = button.getAttribute('data-key');
-    if (value === '⌫') {
-      button.addEventListener('click', () => handlePinDelete());
+    container.querySelectorAll('button[data-key]').forEach(button => {
+      const value = button.getAttribute('data-key');
+      if (value === '⌫') {
+        button.addEventListener('click', () => handlePinDelete());
+      } else {
+        button.addEventListener('click', () => handlePinInput(value));
+      }
+    });
+
+    modalRoot.appendChild(container);
+  }
+
+  const titleEl = container.querySelector('[data-role="title"]');
+  const subtitleEl = container.querySelector('[data-role="subtitle"]');
+  const errorEl = container.querySelector('[data-role="error"]');
+  const dots = container.querySelectorAll('[data-pin-dot]');
+
+  if (titleEl) {
+    titleEl.textContent = modal.mode === 'setup'
+      ? (modal.step === 1 ? '设置4位密码' : '请再次输入以确认')
+      : '输入密码';
+  }
+  if (subtitleEl) {
+    subtitleEl.textContent = modal.mode === 'setup'
+      ? '为这个树洞创建一个密码。'
+      : '请输入密码以进入。';
+  }
+  if (errorEl) {
+    errorEl.textContent = modal.error || '';
+  }
+  dots.forEach((dot, index) => {
+    const filled = modal.step === 2 ? modal.confirmPin.length > index : modal.pin.length > index;
+    if (filled) {
+      dot.classList.add('filled');
     } else {
-      button.addEventListener('click', () => handlePinInput(value));
+      dot.classList.remove('filled');
     }
   });
-
-  modalRoot.appendChild(container);
 }
 
 function renderUpgradeModal() {
