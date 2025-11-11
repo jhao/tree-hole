@@ -69,6 +69,14 @@ function loadTreeHoles() {
     const storedData = localStorage.getItem(TREE_HOLES_DATA_KEY);
     if (storedData) {
       state.treeHoles = JSON.parse(storedData);
+      state.treeHoles.forEach((hole, index) => {
+        if (typeof hole.createdAt !== 'number') {
+          hole.createdAt = 0;
+        }
+        if (!hole.position && initialHolePositions[index]) {
+          hole.position = initialHolePositions[index];
+        }
+      });
     } else {
       state.treeHoles = initialHolePositions.map((position, index) => ({
         id: `hole-${index}`,
@@ -129,6 +137,15 @@ function escapeHtml(text) {
 
 function formatTime(timestamp) {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDateYMD(timestamp) {
+  if (!timestamp) return '';
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
 }
 
 function formatDateTime(timestamp) {
@@ -339,8 +356,39 @@ function handlePinDelete() {
   renderModals();
 }
 
+function resetHole(holeId) {
+  const hole = state.treeHoles.find(h => h.id === holeId);
+  if (!hole) return;
+
+  const wasActive = state.activeHoleId === holeId;
+
+  hole.passwordHash = '';
+  hole.messages = [];
+  hole.name = '';
+  hole.createdAt = 0;
+  saveTreeHoles();
+
+  if (wasActive) {
+    exitActiveHole();
+  } else {
+    closePasswordModal();
+    render();
+  }
+}
+
+function handleHoleResetConfirmation(holeId) {
+  const hole = state.treeHoles.find(h => h.id === holeId);
+  if (!hole) return;
+  const confirmed = confirm('警告：关闭该树洞会清空所有内容，并需要重新设置密码。确定继续吗？');
+  if (!confirmed) {
+    return;
+  }
+  resetHole(holeId);
+}
+
 function renderPasswordModal() {
   const modal = state.passwordModal;
+  const hole = modal ? state.treeHoles.find(h => h.id === modal.holeId) : null;
   let container = document.getElementById('password-modal');
 
   if (!modal || !modal.open) {
@@ -370,6 +418,7 @@ function renderPasswordModal() {
             return `<button type="button" data-key="${key}">${key}</button>`;
           }).join('')}
         </div>
+        <button type="button" class="modal-danger-link" data-action="reset-hole">关闭该树洞，清空里面所有内容</button>
       </div>
     `;
 
@@ -387,6 +436,17 @@ function renderPasswordModal() {
         button.addEventListener('click', () => handlePinInput(value));
       }
     });
+
+    const resetButton = container.querySelector('[data-action="reset-hole"]');
+    if (resetButton) {
+      resetButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        const currentModal = state.passwordModal;
+        if (currentModal) {
+          handleHoleResetConfirmation(currentModal.holeId);
+        }
+      });
+    }
 
     modalRoot.appendChild(container);
   }
@@ -417,6 +477,11 @@ function renderPasswordModal() {
       dot.classList.remove('filled');
     }
   });
+
+  const resetButton = container.querySelector('[data-action="reset-hole"]');
+  if (resetButton) {
+    resetButton.style.display = hole && hole.passwordHash ? 'inline-flex' : 'none';
+  }
 }
 
 function renderUpgradeModal() {
@@ -486,14 +551,21 @@ function getStorageColor(usage) {
 }
 
 function renderMainView() {
-  const treeHolesHtml = state.treeHoles.map(hole => `
-    <div class="tree-hole" style="top: ${hole.position.top}; left: ${hole.position.left};" data-hole-id="${hole.id}">
-      <button type="button" class="${hole.passwordHash ? '' : 'locked'}" aria-label="${hole.passwordHash ? '打开树洞' : '创建树洞'}">
-        ${hole.passwordHash ? '<div style="width:32px;height:32px;border-radius:50%;background:rgba(250,204,21,0.85);animation:pulse 1.6s infinite;"></div>' : lockIcon()}
-      </button>
-      ${hole.name ? `<span class="hole-name">${escapeHtml(hole.name)}</span>` : ''}
-    </div>
-  `).join('');
+  const treeHolesHtml = state.treeHoles.map(hole => {
+    const createdDate = formatDateYMD(hole.createdAt);
+    const dateHtml = createdDate ? `<span class="hole-date">${createdDate}</span>` : '';
+    const nameHtml = hole.name ? `<span class="hole-name">${escapeHtml(hole.name)}</span>` : '';
+    const metaHtml = (dateHtml || nameHtml) ? `<div class="hole-meta">${dateHtml}${nameHtml}</div>` : '';
+
+    return `
+      <div class="tree-hole" style="top: ${hole.position.top}; left: ${hole.position.left};" data-hole-id="${hole.id}">
+        <button type="button" class="${hole.passwordHash ? '' : 'locked'}" aria-label="${hole.passwordHash ? '打开树洞' : '创建树洞'}">
+          ${hole.passwordHash ? '<div style="width:32px;height:32px;border-radius:50%;background:rgba(250,204,21,0.85);animation:pulse 1.6s infinite;"></div>' : lockIcon()}
+        </button>
+        ${metaHtml}
+      </div>
+    `;
+  }).join('');
 
   root.innerHTML = `
     <div class="tree-container">
@@ -539,12 +611,14 @@ function renderChatView() {
 
   const messagesHtml = hole.messages.map(message => {
     const isUser = message.sender === 'user';
-    const bubble = `
-      <div class="message-bubble">
-        ${message.imageUrl ? `<img class="message-image" src="${message.imageUrl}" alt="用户上传的图片" />` : ''}
-        ${message.text ? escapeHtml(message.text).replace(/\n/g, '<br>') : ''}
-      </div>
-    `;
+    const bubbleContent = [];
+    if (message.imageUrl) {
+      bubbleContent.push(`<img class="message-image" src="${message.imageUrl}" alt="用户上传的图片" />`);
+    }
+    if (message.text) {
+      bubbleContent.push(`<div class="message-text">${escapeHtml(message.text).replace(/\n/g, '<br>')}</div>`);
+    }
+    const bubble = `<div class="message-bubble">${bubbleContent.join('')}</div>`;
     return `
       <div class="chat-message ${isUser ? 'from-user' : 'from-ai'}">
         ${bubble}
