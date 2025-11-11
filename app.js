@@ -64,6 +64,19 @@ const state = {
 const root = document.getElementById('root');
 const modalRoot = document.getElementById('modal-root');
 
+let lastTouchEnd = 0;
+document.addEventListener('touchend', (event) => {
+  const now = Date.now();
+  if (now - lastTouchEnd <= 300) {
+    event.preventDefault();
+  }
+  lastTouchEnd = now;
+}, { passive: false });
+
+document.addEventListener('gesturestart', (event) => {
+  event.preventDefault();
+}, false);
+
 function loadTreeHoles() {
   try {
     const storedData = localStorage.getItem(TREE_HOLES_DATA_KEY);
@@ -828,6 +841,7 @@ function attachChatEvents() {
     textarea.addEventListener('input', (event) => {
       state.inputText = event.target.value;
       autoResizeTextarea(event.target);
+      updateSendButtonState();
     });
     textarea.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {
@@ -870,11 +884,20 @@ function attachChatEvents() {
   if (sendButton) {
     sendButton.addEventListener('click', () => handleSendMessage());
   }
+
+  updateSendButtonState();
 }
 
 function autoResizeTextarea(textarea) {
   textarea.style.height = 'auto';
   textarea.style.height = `${Math.min(textarea.scrollHeight, 160)}px`;
+}
+
+function updateSendButtonState() {
+  const sendButton = document.querySelector('[data-action="send"]');
+  if (!sendButton) return;
+  const shouldDisable = state.isLoading || (!state.inputText.trim() && !state.inputImageFile);
+  sendButton.disabled = shouldDisable;
 }
 
 function attachHistoryEvents(filteredMessages) {
