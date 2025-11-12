@@ -67,7 +67,8 @@ const modalRoot = document.getElementById('modal-root');
 let lastTouchEnd = 0;
 document.addEventListener('touchend', (event) => {
   const now = Date.now();
-  if (now - lastTouchEnd <= 300) {
+  const allowRapidTap = event.target && event.target.closest('[data-allow-rapid-tap]');
+  if (now - lastTouchEnd <= 300 && !allowRapidTap) {
     event.preventDefault();
   }
   lastTouchEnd = now;
@@ -423,7 +424,7 @@ function renderPasswordModal() {
           ${[...Array(4)].map((_, index) => `<div class="pin-dot" data-pin-dot="${index}"></div>`).join('')}
         </div>
         <div class="error-text" data-role="error"></div>
-        <div class="keypad" data-role="keypad">
+        <div class="keypad" data-role="keypad" data-allow-rapid-tap>
           ${['1','2','3','4','5','6','7','8','9','','0','⌫'].map(key => {
             if (key === '') {
               return '<span></span>';

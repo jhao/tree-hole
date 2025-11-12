@@ -411,6 +411,7 @@ body {
   resize: none;
   font-size: 0.95rem;
   background: #f1f5f9;
+  color: var(--text-light);
   transition: border 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -418,6 +419,20 @@ body {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+}
+
+.textarea::placeholder {
+  color: rgba(100, 116, 139, 0.8);
+}
+
+.dark .textarea {
+  background: #111827;
+  border-color: #374151;
+  color: var(--text-dark);
+}
+
+.dark .textarea::placeholder {
+  color: rgba(148, 163, 184, 0.8);
 }
 
 .upload-button,
@@ -495,8 +510,8 @@ body {
 
 .history-list {
   padding: 20px 24px 120px;
-  flex: 1;
-  overflow-y: auto;
+  flex: 1 0 auto;
+  overflow: visible;
 }
 
 .history-empty {
