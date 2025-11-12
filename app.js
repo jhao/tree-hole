@@ -1,4 +1,9 @@
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
 const TREE_HOLES_DATA_KEY = 'treeHolesData';
+const SUPABASE_SETTINGS_KEY = 'treeHoleSupabaseSettings';
+const SUPABASE_LAST_SYNC_KEY = 'treeHoleSupabaseLastSync';
+const SUPABASE_TABLE_NAME = 'tree_holes_backups';
 const MAX_STORAGE_BYTES = 5 * 1024 * 1024;
 const STORAGE_WARNING_THRESHOLD = 0.9;
 
@@ -48,7 +53,6 @@ const state = {
   activeHoleId: null,
   activeView: 'chat',
   passwordModal: null,
-  upgradeModalOpen: false,
   storageUsage: 0,
   isLoading: false,
   searchTerm: '',
@@ -58,13 +62,28 @@ const state = {
   editingName: '',
   inputText: '',
   inputImageFile: null,
-  inputImagePreview: null
+  inputImagePreview: null,
+  cloud: {
+    client: null,
+    config: { url: '', anonKey: '' },
+    session: null,
+    isSyncing: false,
+    lastSyncedAt: null,
+    remoteSnapshot: null,
+    statusMessage: '',
+    errorMessage: '',
+    promptedForStorage: false
+  },
+  cloudModal: null
 };
 
 const root = document.getElementById('root');
 const modalRoot = document.getElementById('modal-root');
 
 let lastTouchEnd = 0;
+let cloudSyncTimeoutId = null;
+let skipNextCloudSync = false;
+let cloudAuthSubscription = null;
 document.addEventListener('touchend', (event) => {
   const now = Date.now();
   const allowRapidTap = event.target && event.target.closest('[data-allow-rapid-tap]');
@@ -77,6 +96,299 @@ document.addEventListener('touchend', (event) => {
 document.addEventListener('gesturestart', (event) => {
   event.preventDefault();
 }, false);
+
+function loadSupabaseSettings() {
+  try {
+    const stored = localStorage.getItem(SUPABASE_SETTINGS_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed && typeof parsed === 'object') {
+        state.cloud.config.url = typeof parsed.url === 'string' ? parsed.url : '';
+        state.cloud.config.anonKey = typeof parsed.anonKey === 'string' ? parsed.anonKey : '';
+      }
+    }
+    const lastSync = localStorage.getItem(SUPABASE_LAST_SYNC_KEY);
+    if (lastSync) {
+      const timestamp = Number(lastSync);
+      if (!Number.isNaN(timestamp)) {
+        state.cloud.lastSyncedAt = timestamp;
+      }
+    }
+  } catch (error) {
+    console.error('加载 Supabase 配置失败：', error);
+  }
+}
+
+function persistSupabaseConfig() {
+  try {
+    localStorage.setItem(SUPABASE_SETTINGS_KEY, JSON.stringify(state.cloud.config));
+  } catch (error) {
+    console.error('保存 Supabase 配置失败：', error);
+  }
+}
+
+function setSupabaseConfig(url, anonKey) {
+  state.cloud.config = { url, anonKey };
+  persistSupabaseConfig();
+}
+
+function setCloudSession(session) {
+  state.cloud.session = session;
+  if (!session) {
+    state.cloud.remoteSnapshot = null;
+    state.cloud.statusMessage = '';
+    state.cloud.errorMessage = '';
+  }
+}
+
+function getSupabaseErrorMessage(error) {
+  if (!error) return '未知错误';
+  if (error.code === '42P01') {
+    return `未找到名为 ${SUPABASE_TABLE_NAME} 的表，请先在 Supabase 中创建它。`;
+  }
+  if (error.message) {
+    return error.message;
+  }
+  return '请求失败，请稍后再试。';
+}
+
+async function initSupabaseClient() {
+  const { url, anonKey } = state.cloud.config;
+  if (!url || !anonKey) {
+    state.cloud.client = null;
+    setCloudSession(null);
+    return;
+  }
+
+  state.cloud.errorMessage = '';
+  state.cloud.statusMessage = '';
+
+  try {
+    state.cloud.client = createClient(url, anonKey, {
+      auth: {
+        autoRefreshToken: true,
+        persistSession: true
+      }
+    });
+  } catch (error) {
+    console.error('初始化 Supabase 客户端失败：', error);
+    state.cloud.errorMessage = '无法初始化 Supabase 客户端，请检查配置。';
+    renderModals();
+    return;
+  }
+
+  try {
+    const { data, error } = await state.cloud.client.auth.getSession();
+    if (error) {
+      throw error;
+    }
+    setCloudSession(data.session);
+  } catch (error) {
+    console.error('获取 Supabase 会话失败：', error);
+    state.cloud.errorMessage = getSupabaseErrorMessage(error);
+    renderModals();
+  }
+
+  if (cloudAuthSubscription) {
+    try {
+      cloudAuthSubscription.unsubscribe();
+    } catch (error) {
+      console.warn('取消之前的 Supabase 监听器失败：', error);
+    }
+    cloudAuthSubscription = null;
+  }
+
+  const { data: authListener } = state.cloud.client.auth.onAuthStateChange(async (_event, session) => {
+    setCloudSession(session);
+    if (session) {
+      await fetchCloudSnapshot();
+    } else {
+      state.cloud.lastSyncedAt = null;
+      localStorage.removeItem(SUPABASE_LAST_SYNC_KEY);
+    }
+    render();
+    renderModals();
+  });
+  cloudAuthSubscription = authListener?.subscription || null;
+
+  if (state.cloud.session) {
+    await fetchCloudSnapshot();
+  }
+}
+
+async function fetchCloudSnapshot() {
+  if (!state.cloud.client || !state.cloud.session) {
+    return null;
+  }
+
+  try {
+    const { data, error } = await state.cloud.client
+      .from(SUPABASE_TABLE_NAME)
+      .select('data, updated_at')
+      .eq('user_id', state.cloud.session.user.id)
+      .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+      throw error;
+    }
+
+    if (!data) {
+      state.cloud.remoteSnapshot = null;
+      state.cloud.errorMessage = '';
+      return null;
+    }
+
+    state.cloud.remoteSnapshot = {
+      data: data.data,
+      updatedAt: data.updated_at
+    };
+    state.cloud.errorMessage = '';
+    return state.cloud.remoteSnapshot;
+  } catch (error) {
+    console.error('获取云端数据失败：', error);
+    state.cloud.errorMessage = getSupabaseErrorMessage(error);
+    return null;
+  }
+}
+
+function scheduleCloudSync(immediate = false) {
+  if (!state.cloud.client || !state.cloud.session) {
+    return;
+  }
+  if (skipNextCloudSync) {
+    skipNextCloudSync = false;
+    return;
+  }
+  if (cloudSyncTimeoutId) {
+    clearTimeout(cloudSyncTimeoutId);
+  }
+  cloudSyncTimeoutId = setTimeout(() => {
+    uploadTreeHolesToCloud({ manual: false }).catch(error => {
+      console.error('自动同步到云端失败：', error);
+    });
+    cloudSyncTimeoutId = null;
+  }, immediate ? 0 : 1200);
+}
+
+async function uploadTreeHolesToCloud({ manual } = { manual: true }) {
+  if (!state.cloud.client || !state.cloud.session) {
+    return;
+  }
+
+  if (state.cloud.isSyncing && !manual) {
+    return;
+  }
+
+  state.cloud.isSyncing = true;
+  state.cloud.statusMessage = manual ? '正在备份到云端...' : '正在自动备份到云端...';
+  state.cloud.errorMessage = '';
+  renderModals();
+
+  try {
+    const payload = {
+      user_id: state.cloud.session.user.id,
+      data: state.treeHoles
+    };
+
+    const { error } = await state.cloud.client
+      .from(SUPABASE_TABLE_NAME)
+      .upsert(payload, { onConflict: 'user_id' });
+
+    if (error) {
+      throw error;
+    }
+
+    state.cloud.lastSyncedAt = Date.now();
+    localStorage.setItem(SUPABASE_LAST_SYNC_KEY, String(state.cloud.lastSyncedAt));
+    state.cloud.statusMessage = manual ? '已完成备份。' : '已自动同步到云端。';
+    state.cloud.remoteSnapshot = {
+      data: JSON.parse(JSON.stringify(state.treeHoles)),
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error('上传至云端失败：', error);
+    state.cloud.errorMessage = getSupabaseErrorMessage(error);
+    state.cloud.statusMessage = '';
+  } finally {
+    state.cloud.isSyncing = false;
+    renderModals();
+  }
+}
+
+async function downloadTreeHolesFromCloud() {
+  if (!state.cloud.client || !state.cloud.session) {
+    return;
+  }
+
+  state.cloud.isSyncing = true;
+  state.cloud.statusMessage = '正在从云端恢复数据...';
+  state.cloud.errorMessage = '';
+  renderModals();
+
+  try {
+    const snapshot = await fetchCloudSnapshot();
+    if (!snapshot || !Array.isArray(snapshot.data)) {
+      state.cloud.statusMessage = '云端暂无备份。';
+      return;
+    }
+
+    skipNextCloudSync = true;
+    state.treeHoles = snapshot.data;
+    saveTreeHoles();
+    state.cloud.statusMessage = '已从云端恢复到本地。';
+  } catch (error) {
+    console.error('从云端恢复失败：', error);
+    state.cloud.errorMessage = getSupabaseErrorMessage(error);
+    state.cloud.statusMessage = '';
+  } finally {
+    state.cloud.isSyncing = false;
+    render();
+    renderModals();
+  }
+}
+
+async function signOutFromCloud() {
+  if (!state.cloud.client) {
+    return;
+  }
+  try {
+    await state.cloud.client.auth.signOut();
+  } catch (error) {
+    console.error('退出 Supabase 失败：', error);
+    state.cloud.errorMessage = getSupabaseErrorMessage(error);
+  } finally {
+    setCloudSession(null);
+    state.cloud.lastSyncedAt = null;
+    localStorage.removeItem(SUPABASE_LAST_SYNC_KEY);
+    render();
+    renderModals();
+  }
+}
+
+function openCloudModal(options = {}) {
+  const authMode = options.authMode
+    ? options.authMode
+    : (state.cloud.session ? 'dashboard' : 'signIn');
+  state.cloudModal = {
+    open: true,
+    authMode,
+    email: '',
+    password: '',
+    confirmPassword: '',
+    configUrl: state.cloud.config.url,
+    configAnonKey: state.cloud.config.anonKey,
+    message: options.message || '',
+    error: '',
+    isSubmitting: false,
+    isSavingConfig: false
+  };
+  renderModals();
+}
+
+function closeCloudModal() {
+  state.cloudModal = null;
+  renderModals();
+}
 
 function loadTreeHoles() {
   try {
@@ -116,6 +428,7 @@ function saveTreeHoles() {
     console.error('Failed to save tree holes:', error);
   }
   updateStorageUsage();
+  scheduleCloudSync();
 }
 
 function updateStorageUsage() {
@@ -123,12 +436,20 @@ function updateStorageUsage() {
     const storedData = localStorage.getItem(TREE_HOLES_DATA_KEY);
     if (!storedData) {
       state.storageUsage = 0;
+      state.cloud.promptedForStorage = false;
       return;
     }
     const bytes = new Blob([storedData]).size;
     state.storageUsage = Math.min(1, bytes / MAX_STORAGE_BYTES);
-    if (state.storageUsage > STORAGE_WARNING_THRESHOLD && !state.upgradeModalOpen) {
-      state.upgradeModalOpen = true;
+    if (
+      state.storageUsage > STORAGE_WARNING_THRESHOLD &&
+      !state.cloud.promptedForStorage &&
+      !(state.cloudModal && state.cloudModal.open)
+    ) {
+      state.cloud.promptedForStorage = true;
+      openCloudModal({ message: '本地存储空间接近上限，试试同步到云端吧。' });
+    } else if (state.storageUsage < STORAGE_WARNING_THRESHOLD * 0.6) {
+      state.cloud.promptedForStorage = false;
     }
   } catch (error) {
     console.error('Failed to calculate storage usage:', error);
@@ -498,64 +819,309 @@ function renderPasswordModal() {
   }
 }
 
-function renderUpgradeModal() {
-  const existing = document.getElementById('upgrade-modal');
+function renderCloudModal() {
+  const modalState = state.cloudModal;
+  const existing = document.getElementById('cloud-modal');
+  if (!modalState || !modalState.open) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  if (state.cloud.session && modalState.authMode !== 'dashboard') {
+    modalState.authMode = 'dashboard';
+  }
+  if (!state.cloud.session && modalState.authMode === 'dashboard') {
+    modalState.authMode = 'signIn';
+  }
+
   if (existing) {
     existing.remove();
   }
-  if (!state.upgradeModalOpen) return;
+
+  const hasConfig = modalState.configUrl.trim() && modalState.configAnonKey.trim();
+  const session = state.cloud.session;
+  const lastSyncText = state.cloud.lastSyncedAt
+    ? formatDateTime(state.cloud.lastSyncedAt)
+    : '尚未同步';
+  const remoteUpdatedTimestamp = state.cloud.remoteSnapshot?.updatedAt
+    ? Date.parse(state.cloud.remoteSnapshot.updatedAt)
+    : null;
+  const remoteUpdatedText = remoteUpdatedTimestamp && !Number.isNaN(remoteUpdatedTimestamp)
+    ? formatDateTime(remoteUpdatedTimestamp)
+    : '暂无云端备份';
+  const statusMessage = state.cloud.statusMessage;
+  const successMessage = modalState.message;
+  const errorMessage = modalState.error || state.cloud.errorMessage;
+  const disableConfigInputs = modalState.isSavingConfig;
+  const disableAuthInputs = modalState.isSubmitting || state.cloud.isSyncing;
+  const disableActions = state.cloud.isSyncing;
+
+  const authTabsHtml = `
+    <div class="cloud-auth-tabs">
+      <button type="button" data-auth-mode="signIn" class="${modalState.authMode === 'signIn' ? 'active' : ''}">登录</button>
+      <button type="button" data-auth-mode="signUp" class="${modalState.authMode === 'signUp' ? 'active' : ''}">注册</button>
+    </div>
+  `;
+
+  const authFormHtml = `
+    <section class="cloud-section">
+      <h3>2. 登录 Supabase 账号</h3>
+      ${authTabsHtml}
+      <label class="cloud-field">
+        <span>邮箱</span>
+        <input type="email" name="cloud-email" placeholder="you@example.com" value="${escapeHtml(modalState.email)}" ${disableAuthInputs ? 'disabled' : ''} />
+      </label>
+      <label class="cloud-field">
+        <span>密码</span>
+        <input type="password" name="cloud-password" placeholder="至少 6 位字符" value="${escapeHtml(modalState.password)}" ${disableAuthInputs ? 'disabled' : ''} />
+      </label>
+      ${modalState.authMode === 'signUp' ? `
+        <label class="cloud-field">
+          <span>确认密码</span>
+          <input type="password" name="cloud-confirm" placeholder="再次输入密码" value="${escapeHtml(modalState.confirmPassword)}" ${disableAuthInputs ? 'disabled' : ''} />
+        </label>
+      ` : ''}
+      <button type="button" class="cloud-button primary" data-action="cloud-auth-submit" ${disableAuthInputs ? 'disabled' : ''}>
+        ${modalState.isSubmitting ? '提交中...' : (modalState.authMode === 'signIn' ? '登录' : '注册')}
+      </button>
+      <p class="cloud-hint">注册时将使用 Supabase 的邮箱登录流程。若开启邮箱验证，请在收件箱中完成确认后再登录。</p>
+    </section>
+  `;
+
+  const dashboardHtml = `
+    <section class="cloud-section">
+      <h3>2. 管理云端备份</h3>
+      <div class="cloud-summary">
+        <p><strong>当前账号：</strong>${escapeHtml(session?.user?.email || '')}</p>
+        <p><strong>上次同步：</strong>${escapeHtml(lastSyncText)}</p>
+        <p><strong>云端最近备份：</strong>${escapeHtml(remoteUpdatedText)}</p>
+      </div>
+      <div class="cloud-actions">
+        <button type="button" class="cloud-button primary" data-action="cloud-sync-now" ${disableActions ? 'disabled' : ''}>立即备份</button>
+        <button type="button" class="cloud-button secondary" data-action="cloud-download" ${disableActions ? 'disabled' : ''}>从云端恢复</button>
+        <button type="button" class="cloud-button danger" data-action="cloud-sign-out" ${disableActions ? 'disabled' : ''}>退出登录</button>
+      </div>
+    </section>
+  `;
 
   const container = document.createElement('div');
-  container.id = 'upgrade-modal';
+  container.id = 'cloud-modal';
   container.className = 'modal-overlay';
   container.innerHTML = `
-    <div class="modal-card" role="dialog" aria-modal="true">
-      <h2 class="modal-title">升级您的存储</h2>
-      <p class="modal-subtitle">您的本地存储空间即将用尽。升级到云存储，以安全地保存您的所有记录，并在任何设备上访问它们。</p>
-      <div class="upgrade-options">
-        ${[
-          { name: 'Firebase Firestore', description: 'Google提供的实时NoSQL数据库，易于集成和扩展。' },
-          { name: 'Supabase', description: '开源的Firebase替代品，提供PostgreSQL数据库和自动生成的API。' },
-          { name: 'AWS DynamoDB', description: '亚马逊提供的完全托管的NoSQL数据库，具有高可用性和可扩展性。' }
-        ].map(option => `
-          <div class="history-item" style="margin-bottom: 12px;">
-            <div>
-              <p style="font-weight: 600; color: var(--accent); margin-bottom: 6px;">${option.name}</p>
-              <p style="font-size: 0.9rem; color: var(--muted); margin: 0;">${option.description}</p>
-            </div>
-          </div>
-        `).join('')}
-      </div>
-      <div class="modal-actions">
-        <button type="button" class="secondary" data-action="later">以后再说</button>
-        <button type="button" class="primary" data-action="upgrade">登录并开始升级</button>
-      </div>
+    <div class="modal-card cloud-modal-card" role="dialog" aria-modal="true">
+      <button type="button" class="cloud-close" data-action="close-cloud-modal" aria-label="关闭">×</button>
+      <h2 class="modal-title">云端同步（Supabase）</h2>
+      <p class="modal-subtitle">将树洞内容备份到 Supabase，登录后可在不同设备间同步与恢复。</p>
+      ${successMessage ? `<div class="cloud-banner success">${escapeHtml(successMessage)}</div>` : ''}
+      ${statusMessage ? `<div class="cloud-banner info">${escapeHtml(statusMessage)}</div>` : ''}
+      ${errorMessage ? `<div class="cloud-banner error">${escapeHtml(errorMessage)}</div>` : ''}
+      <section class="cloud-section">
+        <h3>1. 填写项目配置</h3>
+        <label class="cloud-field">
+          <span>Supabase URL</span>
+          <input type="url" name="supabase-url" placeholder="https://xxxx.supabase.co" value="${escapeHtml(modalState.configUrl)}" ${disableConfigInputs ? 'disabled' : ''} />
+        </label>
+        <label class="cloud-field">
+          <span>Supabase 匿名密钥</span>
+          <input type="password" name="supabase-key" placeholder="eyJhbGciOi..." value="${escapeHtml(modalState.configAnonKey)}" ${disableConfigInputs ? 'disabled' : ''} />
+        </label>
+        <button type="button" class="cloud-button primary" data-action="cloud-save-config" ${disableConfigInputs ? 'disabled' : ''}>
+          ${modalState.isSavingConfig ? '保存中...' : '保存配置'}
+        </button>
+        <p class="cloud-hint">请在 Supabase 的 SQL 编辑器中创建 <code>${SUPABASE_TABLE_NAME}</code> 表：
+          <code>create table if not exists ${SUPABASE_TABLE_NAME} (user_id uuid primary key references auth.users, data jsonb not null, updated_at timestamptz default now());</code>
+        </p>
+      </section>
+      ${hasConfig ? (session ? dashboardHtml : authFormHtml) : `<section class="cloud-section"><p class="cloud-hint">保存配置后即可登录 Supabase。</p></section>`}
     </div>
   `;
 
   container.addEventListener('click', (event) => {
     if (event.target === container) {
-      state.upgradeModalOpen = false;
-      renderModals();
+      closeCloudModal();
     }
   });
 
-  container.querySelector('[data-action="later"]').addEventListener('click', () => {
-    state.upgradeModalOpen = false;
-    renderModals();
-  });
-  container.querySelector('[data-action="upgrade"]').addEventListener('click', () => {
-    state.upgradeModalOpen = false;
-    renderModals();
-    alert('敬请期待云端功能 ✨');
-  });
+  const closeButton = container.querySelector('[data-action="close-cloud-modal"]');
+  if (closeButton) {
+    closeButton.addEventListener('click', () => closeCloudModal());
+  }
+
+  const urlInput = container.querySelector('input[name="supabase-url"]');
+  if (urlInput) {
+    urlInput.addEventListener('input', (event) => {
+      modalState.configUrl = event.target.value;
+    });
+  }
+
+  const keyInput = container.querySelector('input[name="supabase-key"]');
+  if (keyInput) {
+    keyInput.addEventListener('input', (event) => {
+      modalState.configAnonKey = event.target.value;
+    });
+  }
+
+  const saveButton = container.querySelector('[data-action="cloud-save-config"]');
+  if (saveButton) {
+    saveButton.addEventListener('click', async () => {
+      const url = modalState.configUrl.trim();
+      const anonKey = modalState.configAnonKey.trim();
+      if (!url || !anonKey) {
+        modalState.error = '请填写完整的 Supabase 项目信息。';
+        modalState.message = '';
+        renderCloudModal();
+        return;
+      }
+      modalState.isSavingConfig = true;
+      modalState.error = '';
+      modalState.message = '';
+      modalState.configUrl = url;
+      modalState.configAnonKey = anonKey;
+      renderCloudModal();
+      try {
+        setSupabaseConfig(url, anonKey);
+        await initSupabaseClient();
+        if (state.cloud.client) {
+          modalState.message = 'Supabase 配置已保存。';
+        } else {
+          modalState.error = state.cloud.errorMessage || '无法连接到 Supabase，请检查配置。';
+        }
+      } catch (error) {
+        console.error('保存 Supabase 配置失败：', error);
+        modalState.error = '保存配置失败，请稍后重试。';
+      } finally {
+        modalState.isSavingConfig = false;
+        renderCloudModal();
+      }
+    });
+  }
+
+  if (hasConfig && !session) {
+    container.querySelectorAll('[data-auth-mode]').forEach(button => {
+      button.addEventListener('click', (event) => {
+        const mode = event.currentTarget.getAttribute('data-auth-mode');
+        if (mode && (mode === 'signIn' || mode === 'signUp')) {
+          modalState.authMode = mode;
+          modalState.error = '';
+          modalState.message = '';
+          renderCloudModal();
+        }
+      });
+    });
+
+    const emailInput = container.querySelector('input[name="cloud-email"]');
+    if (emailInput) {
+      emailInput.addEventListener('input', (event) => {
+        modalState.email = event.target.value;
+      });
+    }
+
+    const passwordInput = container.querySelector('input[name="cloud-password"]');
+    if (passwordInput) {
+      passwordInput.addEventListener('input', (event) => {
+        modalState.password = event.target.value;
+      });
+    }
+
+    const confirmInput = container.querySelector('input[name="cloud-confirm"]');
+    if (confirmInput) {
+      confirmInput.addEventListener('input', (event) => {
+        modalState.confirmPassword = event.target.value;
+      });
+    }
+
+    const authSubmit = container.querySelector('[data-action="cloud-auth-submit"]');
+    if (authSubmit) {
+      authSubmit.addEventListener('click', async () => {
+        const email = modalState.email.trim();
+        const password = modalState.password;
+        if (!email || !password) {
+          modalState.error = '请输入邮箱和密码。';
+          modalState.message = '';
+          renderCloudModal();
+          return;
+        }
+        if (modalState.authMode === 'signUp' && password !== modalState.confirmPassword) {
+          modalState.error = '两次输入的密码不一致。';
+          modalState.message = '';
+          renderCloudModal();
+          return;
+        }
+        if (!state.cloud.client) {
+          modalState.error = '请先保存有效的 Supabase 配置。';
+          renderCloudModal();
+          return;
+        }
+
+        modalState.isSubmitting = true;
+        modalState.error = '';
+        modalState.message = '';
+        renderCloudModal();
+
+        try {
+          if (modalState.authMode === 'signIn') {
+            const { error } = await state.cloud.client.auth.signInWithPassword({ email, password });
+            if (error) {
+              modalState.error = getSupabaseErrorMessage(error);
+            } else {
+              modalState.message = '登录成功！';
+            }
+          } else {
+            const { data, error } = await state.cloud.client.auth.signUp({ email, password });
+            if (error) {
+              modalState.error = getSupabaseErrorMessage(error);
+            } else if (data.session) {
+              modalState.message = '注册成功，已自动登录。';
+            } else {
+              modalState.message = '注册成功，请到邮箱完成验证后再登录。';
+            }
+            modalState.confirmPassword = '';
+          }
+          if (!modalState.error) {
+            modalState.password = '';
+          }
+        } catch (error) {
+          console.error('Supabase 认证失败：', error);
+          modalState.error = getSupabaseErrorMessage(error);
+        } finally {
+          modalState.isSubmitting = false;
+          renderCloudModal();
+        }
+      });
+    }
+  }
+
+  if (hasConfig && session) {
+    const syncButton = container.querySelector('[data-action="cloud-sync-now"]');
+    if (syncButton) {
+      syncButton.addEventListener('click', async () => {
+        await uploadTreeHolesToCloud({ manual: true });
+      });
+    }
+
+    const downloadButton = container.querySelector('[data-action="cloud-download"]');
+    if (downloadButton) {
+      downloadButton.addEventListener('click', async () => {
+        await downloadTreeHolesFromCloud();
+      });
+    }
+
+    const signOutButton = container.querySelector('[data-action="cloud-sign-out"]');
+    if (signOutButton) {
+      signOutButton.addEventListener('click', async () => {
+        await signOutFromCloud();
+      });
+    }
+  }
 
   modalRoot.appendChild(container);
 }
 
 function renderModals() {
   renderPasswordModal();
-  renderUpgradeModal();
+  renderCloudModal();
 }
 
 function getStorageColor(usage) {
@@ -666,7 +1232,7 @@ function renderChatView() {
       </header>
       <main class="chat-body messages" id="messages">${messagesHtml}${typingHtml}</main>
       <footer class="chat-footer">
-        <div class="storage-indicator" data-action="upgrade">
+        <div class="storage-indicator" data-action="cloud-sync">
           <div class="storage-label">
             <span>本地存储空间</span>
             <span>${usagePercent}%</span>
@@ -733,7 +1299,7 @@ function renderHistoryView() {
       <header class="history-header">
         <button class="icon-button" type="button" data-action="back-chat" aria-label="返回聊天">${arrowLeftIcon()}</button>
         <h1 style="flex:1;font-size:1.1rem;margin:0;">聊天记录: ${hole.name ? escapeHtml(hole.name) : '未命名'}</h1>
-        <div class="storage-indicator" style="max-width:220px;" data-action="upgrade">
+        <div class="storage-indicator" style="max-width:220px;" data-action="cloud-sync">
           <div class="storage-label">
             <span>存储</span>
             <span>${usagePercent}%</span>
@@ -809,10 +1375,9 @@ function attachChatEvents() {
     });
   }
 
-  const upgradeAreas = document.querySelectorAll('[data-action="upgrade"]');
-  upgradeAreas.forEach(area => area.addEventListener('click', () => {
-    state.upgradeModalOpen = true;
-    renderModals();
+  const cloudAreas = document.querySelectorAll('[data-action="cloud-sync"]');
+  cloudAreas.forEach(area => area.addEventListener('click', () => {
+    openCloudModal();
   }));
 
   const nameInput = document.getElementById('hole-name-input');
@@ -910,10 +1475,9 @@ function attachHistoryEvents(filteredMessages) {
     });
   }
 
-  document.querySelectorAll('[data-action="upgrade"]').forEach(area => {
+  document.querySelectorAll('[data-action="cloud-sync"]').forEach(area => {
     area.addEventListener('click', () => {
-      state.upgradeModalOpen = true;
-      renderModals();
+      openCloudModal();
     });
   });
 
@@ -1130,5 +1694,9 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+loadSupabaseSettings();
+initSupabaseClient().catch(error => {
+  console.error('初始化 Supabase 失败：', error);
+});
 loadTreeHoles();
 render();
