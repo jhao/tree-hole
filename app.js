@@ -1,4 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+import CryptoJS from 'https://cdn.jsdelivr.net/npm/crypto-js@4.2.0/+esm';
 
 const TREE_HOLES_DATA_KEY = 'treeHolesData';
 const SUPABASE_SETTINGS_KEY = 'treeHoleSupabaseSettings';
@@ -48,6 +49,118 @@ const contentTypeKeywords = {
   '心情': ['感觉', '觉得', '心情', '情绪']
 };
 
+function tripleMd5(value) {
+  let hash = CryptoJS.MD5(value);
+  hash = CryptoJS.MD5(hash.toString());
+  hash = CryptoJS.MD5(hash.toString());
+  return hash.toString();
+}
+
+function encryptWithPassword(plainText, password) {
+  if (!plainText) {
+    return '';
+  }
+  return CryptoJS.AES.encrypt(plainText, password).toString();
+}
+
+function decryptWithPassword(cipherText, password) {
+  if (!cipherText) {
+    return '';
+  }
+  try {
+    const bytes = CryptoJS.AES.decrypt(cipherText, password);
+    const decrypted = bytes.toString(CryptoJS.enc.Utf8);
+    return decrypted || '';
+  } catch (error) {
+    console.error('解密失败：', error);
+    return '';
+  }
+}
+
+function setActiveHolePassword(holeId, password) {
+  state.activePasswords[holeId] = password;
+}
+
+function getActiveHolePassword(holeId) {
+  return state.activePasswords[holeId] || null;
+}
+
+function clearActiveHolePassword(holeId) {
+  delete state.activePasswords[holeId];
+}
+
+function parseDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string') {
+    return null;
+  }
+  const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!matches) {
+    return null;
+  }
+  return {
+    mimeType: matches[1],
+    data: matches[2]
+  };
+}
+
+function getDecryptedMessageContent(hole, message) {
+  const password = getActiveHolePassword(hole.id);
+  if (!password) {
+    return { text: '', imageUrl: null };
+  }
+
+  let text = '';
+  if (typeof message.encryptedText === 'string' && message.encryptedText) {
+    text = decryptWithPassword(message.encryptedText, password);
+  } else if (typeof message.text === 'string') {
+    text = message.text;
+  }
+
+  let imageUrl = null;
+  if (typeof message.encryptedImage === 'string' && message.encryptedImage) {
+    const decrypted = decryptWithPassword(message.encryptedImage, password);
+    if (decrypted) {
+      try {
+        const payload = JSON.parse(decrypted);
+        if (payload && payload.data) {
+          const mimeType = payload.mimeType || 'image/png';
+          imageUrl = `data:${mimeType};base64,${payload.data}`;
+        }
+      } catch (error) {
+        console.error('解析解密后的图片数据失败：', error);
+      }
+    }
+  } else if (typeof message.imageUrl === 'string') {
+    imageUrl = message.imageUrl;
+  }
+
+  return { text, imageUrl };
+}
+
+function migrateHoleMessagesToEncrypted(hole, password) {
+  if (!hole || !Array.isArray(hole.messages) || !password) {
+    return false;
+  }
+  let updated = false;
+  hole.messages.forEach(message => {
+    if (typeof message.text === 'string' && message.text && !message.encryptedText) {
+      message.encryptedText = encryptWithPassword(message.text, password);
+      delete message.text;
+      updated = true;
+    }
+    if (typeof message.imageUrl === 'string' && message.imageUrl && !message.encryptedImage) {
+      const parsed = parseDataUrl(message.imageUrl);
+      if (parsed) {
+        const payload = JSON.stringify({ data: parsed.data, mimeType: parsed.mimeType });
+        message.encryptedImage = encryptWithPassword(payload, password);
+        delete message.imageUrl;
+        updated = true;
+      }
+    }
+  });
+  return updated;
+}
+
 const state = {
   treeHoles: [],
   activeHoleId: null,
@@ -74,7 +187,8 @@ const state = {
     errorMessage: '',
     promptedForStorage: false
   },
-  cloudModal: null
+  cloudModal: null,
+  activePasswords: {}
 };
 
 const root = document.getElementById('root');
@@ -423,7 +537,19 @@ function loadTreeHoles() {
 
 function saveTreeHoles() {
   try {
-    localStorage.setItem(TREE_HOLES_DATA_KEY, JSON.stringify(state.treeHoles));
+    const sanitizedTreeHoles = state.treeHoles.map(hole => {
+      const sanitizedMessages = Array.isArray(hole.messages)
+        ? hole.messages.map(message => {
+            const { decryptedText, decryptedImageUrl, ...rest } = message;
+            const sanitizedMessage = { ...rest };
+            delete sanitizedMessage.text;
+            delete sanitizedMessage.imageUrl;
+            return sanitizedMessage;
+          })
+        : [];
+      return { ...hole, messages: sanitizedMessages };
+    });
+    localStorage.setItem(TREE_HOLES_DATA_KEY, JSON.stringify(sanitizedTreeHoles));
   } catch (error) {
     console.error('Failed to save tree holes:', error);
   }
@@ -578,6 +704,9 @@ function setActiveHole(holeId) {
 }
 
 function exitActiveHole() {
+  if (state.activeHoleId) {
+    clearActiveHolePassword(state.activeHoleId);
+  }
   state.activeHoleId = null;
   state.activeView = 'chat';
   state.selectedMessageIds.clear();
@@ -630,8 +759,10 @@ function handlePinInput(value) {
         if (modal.confirmPin === modal.pin) {
           const hole = state.treeHoles.find(h => h.id === modal.holeId);
           if (hole) {
-            hole.passwordHash = modal.confirmPin;
+            const hashedPassword = tripleMd5(modal.confirmPin);
+            hole.passwordHash = hashedPassword;
             hole.createdAt = Date.now();
+            setActiveHolePassword(hole.id, modal.confirmPin);
             saveTreeHoles();
             closePasswordModal();
             setActiveHole(hole.id);
@@ -656,19 +787,32 @@ function handlePinInput(value) {
       modal.pin += value;
       if (modal.pin.length === 4) {
         const hole = state.treeHoles.find(h => h.id === modal.holeId);
-        if (hole && modal.pin === hole.passwordHash) {
-          closePasswordModal();
-          setActiveHole(hole.id);
-        } else {
-          modal.error = '密码错误，请重试。';
-          setTimeout(() => {
-            const current = state.passwordModal;
-            if (current && current.holeId === modal.holeId) {
-              current.pin = '';
-              current.error = '';
-              renderModals();
+        if (hole) {
+          const hashedInput = tripleMd5(modal.pin);
+          const isLegacy = hole.passwordHash === modal.pin;
+          const isMatch = hole.passwordHash === hashedInput || isLegacy;
+          if (isMatch) {
+            if (isLegacy) {
+              hole.passwordHash = hashedInput;
             }
-          }, 1400);
+            const migrated = migrateHoleMessagesToEncrypted(hole, modal.pin);
+            setActiveHolePassword(hole.id, modal.pin);
+            if (isLegacy || migrated) {
+              saveTreeHoles();
+            }
+            closePasswordModal();
+            setActiveHole(hole.id);
+          } else {
+            modal.error = '密码错误，请重试。';
+            setTimeout(() => {
+              const current = state.passwordModal;
+              if (current && current.holeId === modal.holeId) {
+                current.pin = '';
+                current.error = '';
+                renderModals();
+              }
+            }, 1400);
+          }
         }
       }
     }
@@ -696,6 +840,8 @@ function resetHole(holeId) {
   if (!hole) return;
 
   const wasActive = state.activeHoleId === holeId;
+
+  clearActiveHolePassword(holeId);
 
   hole.passwordHash = '';
   hole.messages = [];
@@ -1191,12 +1337,14 @@ function renderChatView() {
 
   const messagesHtml = hole.messages.map(message => {
     const isUser = message.sender === 'user';
+    const { text: decryptedText, imageUrl } = getDecryptedMessageContent(hole, message);
+    const displayText = decryptedText || (message.encryptedText ? '（内容无法解密）' : '');
     const bubbleContent = [];
-    if (message.imageUrl) {
-      bubbleContent.push(`<img class="message-image" src="${message.imageUrl}" alt="用户上传的图片" />`);
+    if (imageUrl) {
+      bubbleContent.push(`<img class="message-image" src="${imageUrl}" alt="用户上传的图片" />`);
     }
-    if (message.text) {
-      bubbleContent.push(`<div class="message-text">${escapeHtml(message.text).replace(/\n/g, '<br>')}</div>`);
+    if (displayText) {
+      bubbleContent.push(`<div class="message-text">${escapeHtml(displayText).replace(/\n/g, '<br>')}</div>`);
     }
     const bubble = `<div class="message-bubble">${bubbleContent.join('')}</div>`;
     return `
@@ -1283,8 +1431,8 @@ function renderHistoryView() {
           <label class="history-item">
             <input type="checkbox" data-message-id="${message.id}" ${checked} style="margin-top:6px;" />
             <div style="flex:1;">
-              ${message.imageUrl ? `<img src="${message.imageUrl}" alt="用户上传的图片" />` : ''}
-              <p>${escapeHtml(message.text).replace(/\n/g, '<br>')}</p>
+              ${message.decryptedImageUrl ? `<img src="${message.decryptedImageUrl}" alt="用户上传的图片" />` : ''}
+              <p>${escapeHtml(message.decryptedText || (message.encryptedText ? '（内容无法解密）' : '')).replace(/\n/g, '<br>')}</p>
               ${badges}
               <div class="meta">${formatDateTime(message.timestamp)}</div>
             </div>
@@ -1343,8 +1491,17 @@ function renderHistoryView() {
 function getFilteredMessages(hole) {
   return hole.messages
     .filter(message => message.sender === 'user')
+    .map(message => {
+      const { text, imageUrl } = getDecryptedMessageContent(hole, message);
+      return {
+        ...message,
+        decryptedText: text,
+        decryptedImageUrl: imageUrl
+      };
+    })
     .filter(message => {
-      const matchesText = !state.searchTerm || (message.text && message.text.toLowerCase().includes(state.searchTerm.toLowerCase()));
+      const text = message.decryptedText || '';
+      const matchesText = !state.searchTerm || (text && text.toLowerCase().includes(state.searchTerm.toLowerCase()));
       const matchesEmotion = state.emotionFilter === 'all' || message.classification?.emotion === state.emotionFilter;
       const matchesType = state.contentTypeFilter === 'all' || message.classification?.content_type === state.contentTypeFilter;
       return matchesText && matchesEmotion && matchesType;
@@ -1552,16 +1709,22 @@ async function handleSendMessage() {
   const hole = getActiveHole();
   if (!hole) return;
 
+  const password = getActiveHolePassword(hole.id);
+  if (!password) {
+    console.error('缺少用于加密的树洞密码。');
+    state.isLoading = false;
+    render();
+    return;
+  }
+
   state.isLoading = true;
   render();
 
-  let imageDisplayUrl = null;
   let imagePayload = null;
   if (state.inputImageFile) {
     try {
-      const { displayUrl } = await fileToBase64(state.inputImageFile);
-      imageDisplayUrl = displayUrl;
-      imagePayload = { present: true };
+      const { data, mimeType } = await fileToBase64(state.inputImageFile);
+      imagePayload = { present: true, data, mimeType };
     } catch (error) {
       console.error('处理图片时出错：', error);
       state.isLoading = false;
@@ -1572,11 +1735,17 @@ async function handleSendMessage() {
   }
 
   const messageId = `user-${Date.now()}`;
+  const encryptedText = text ? encryptWithPassword(text, password) : '';
+  let encryptedImage = '';
+  if (imagePayload && imagePayload.present) {
+    const payload = JSON.stringify({ data: imagePayload.data, mimeType: imagePayload.mimeType });
+    encryptedImage = encryptWithPassword(payload, password);
+  }
   const userMessage = {
     id: messageId,
     sender: 'user',
-    text,
-    imageUrl: imageDisplayUrl,
+    encryptedText,
+    encryptedImage,
     timestamp: Date.now()
   };
   hole.messages.push(userMessage);
@@ -1603,7 +1772,8 @@ async function handleSendMessage() {
     const aiMessage = {
       id: `ai-${Date.now()}`,
       sender: 'ai',
-      text: replyText,
+      encryptedText: encryptWithPassword(replyText, password),
+      encryptedImage: '',
       timestamp: Date.now()
     };
     hole.messages.push(aiMessage);
@@ -1613,7 +1783,8 @@ async function handleSendMessage() {
     const aiMessage = {
       id: `ai-error-${Date.now()}`,
       sender: 'ai',
-      text: '抱歉，我好像走神了。你能再说一遍吗？',
+      encryptedText: encryptWithPassword('抱歉，我好像走神了。你能再说一遍吗？', password),
+      encryptedImage: '',
       timestamp: Date.now()
     };
     hole.messages.push(aiMessage);
