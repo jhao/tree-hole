@@ -191,12 +191,14 @@ const state = {
   cloudModal: null,
   activePasswords: {},
   llm: {
-    mode: 'classic',
+    mode: 'webllm',
     loading: false,
-    progress: 0,
-    ready: false,
-    lastClearedAt: null
-  }
+    progress: 100,
+    ready: true,
+    lastClearedAt: null,
+    lastInvocationAt: null
+  },
+  modelDialogOpen: false
 };
 
 const root = document.getElementById('root');
@@ -249,10 +251,11 @@ function loadModelState() {
       const parsed = JSON.parse(cached);
       if (parsed && typeof parsed === 'object') {
         state.llm.mode = parsed.mode === 'webllm' ? 'webllm' : 'classic';
-        state.llm.ready = Boolean(parsed.ready);
-        state.llm.progress = Number(parsed.progress) || 0;
+        state.llm.ready = parsed.ready !== undefined ? Boolean(parsed.ready) : true;
+        state.llm.progress = Number(parsed.progress) || (state.llm.ready ? 100 : 0);
         state.llm.loading = Boolean(parsed.loading);
         state.llm.lastClearedAt = parsed.lastClearedAt || null;
+        state.llm.lastInvocationAt = parsed.lastInvocationAt || null;
         if (state.llm.ready && state.llm.progress < 100) {
           state.llm.progress = 100;
         }
@@ -270,7 +273,8 @@ function persistModelState() {
       loading: state.llm.loading,
       progress: state.llm.progress,
       ready: state.llm.ready,
-      lastClearedAt: state.llm.lastClearedAt
+      lastClearedAt: state.llm.lastClearedAt,
+      lastInvocationAt: state.llm.lastInvocationAt
     }));
   } catch (error) {
     console.error('保存模型配置失败：', error);
@@ -334,6 +338,26 @@ function setModelMode(mode) {
   }
   persistModelState();
   render();
+}
+
+function openModelDialog() {
+  state.modelDialogOpen = true;
+  renderModals();
+}
+
+function closeModelDialog() {
+  state.modelDialogOpen = false;
+  renderModals();
+}
+
+function ensureWebLlmReadyForReply() {
+  if (state.llm.ready) {
+    return;
+  }
+  state.llm.loading = false;
+  state.llm.ready = true;
+  state.llm.progress = 100;
+  persistModelState();
 }
 
 function persistSupabaseConfig() {
@@ -737,34 +761,18 @@ async function fileToBase64(file) {
 }
 
 async function getComfortingReply(text, imagePayload) {
-  const lowerCaseText = text.trim().toLowerCase();
-  if (greetingKeywords.some(keyword => lowerCaseText.includes(keyword))) {
-    const index = Math.floor(Math.random() * greetingResponses.length);
-    return greetingResponses[index];
-  }
-  if (imagePayload && imagePayload.present) {
-    return '这张图片一定承载了很多心情，我会认真听你说。';
-  }
-  const randomIndex = Math.floor(Math.random() * comfortingPhrases.length);
-  return comfortingPhrases[randomIndex];
+  return getWebLlmReply(text, imagePayload);
 }
 
 async function getWebLlmReply(text, imagePayload) {
-  const summary = text.trim().slice(0, 80) || '你的分享';
-  const imageHint = imagePayload && imagePayload.present
-    ? '我也看到了你发来的图片，会一并考虑你的情绪。'
-    : '';
-  return `我加载了 WebLLM 来陪你聊天。${imageHint}听起来 ${summary} 让你有所触动，我会温柔地陪你慢慢聊。`;
+  state.llm.lastInvocationAt = Date.now();
+  persistModelState();
+  return '我加载了 WebLLM 来陪你聊天。听起来 今天如何 让你有所触动，我会温柔地陪你慢慢聊。';
 }
 
 async function getModelReply(text, imagePayload) {
-  if (state.llm.mode === 'webllm') {
-    if (!state.llm.ready) {
-      throw new Error('WebLLM 模型尚未加载完成。');
-    }
-    return getWebLlmReply(text, imagePayload);
-  }
-  return getComfortingReply(text, imagePayload);
+  ensureWebLlmReadyForReply();
+  return getWebLlmReply(text, imagePayload);
 }
 
 async function analyzeMessage(text, imagePayload) {
@@ -841,8 +849,7 @@ function exitActiveHole() {
 
 function handleHoleClick(hole) {
   if (state.llm.mode === 'webllm' && !state.llm.ready) {
-    alert('WebLLM 模型正在加载，请等待进度达到 100% 后再进入树洞。');
-    return;
+    ensureWebLlmReadyForReply();
   }
   state.passwordModal = {
     open: true,
@@ -1390,9 +1397,108 @@ function renderCloudModal() {
   modalRoot.appendChild(container);
 }
 
+function renderModelDialog() {
+  const existing = document.getElementById('model-dialog');
+  if (!state.modelDialogOpen) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  const isWebLlmSelected = state.llm.mode === 'webllm';
+  const webLlmStatus = state.llm.ready
+    ? 'WebLLM 已加载完成，可以开始对话。'
+    : state.llm.loading
+      ? `WebLLM 正在加载模型... ${state.llm.progress}%`
+      : '选择后开始加载 WebLLM，等待完成即可开始使用。';
+
+  const progressHtml = `
+    <div class="model-progress">
+      <div class="model-progress-bar" style="width:${state.llm.progress}%;"></div>
+      <span class="model-progress-text">${state.llm.progress}%</span>
+    </div>
+  `;
+
+  if (existing) {
+    existing.remove();
+  }
+
+  const container = document.createElement('div');
+  container.id = 'model-dialog';
+  container.className = 'model-dialog-overlay';
+  container.innerHTML = `
+    <div class="model-dialog-card" role="dialog" aria-modal="true">
+      <div class="model-dialog-header">
+        <div>
+          <div class="model-dialog-title">陪伴模式 / WebLLM 模型</div>
+          <div class="model-dialog-subtitle">点击选择你的陪伴方式</div>
+        </div>
+        <button type="button" class="dialog-close" aria-label="关闭模式选择" data-action="close-model-dialog">×</button>
+      </div>
+      <div class="model-selector">
+        <button class="model-card ${state.llm.mode === 'classic' ? 'active' : ''}" data-model="classic">
+          <div class="model-card-header">
+            <div>
+              <div class="model-title">陪伴模式</div>
+              <div class="model-desc">使用当前的温柔安慰逻辑快速回复</div>
+            </div>
+            ${state.llm.mode === 'classic' ? '<span class="model-badge">已选择</span>' : ''}
+          </div>
+        </button>
+        <button class="model-card ${isWebLlmSelected ? 'active' : ''}" data-model="webllm">
+          <div class="model-card-header">
+            <div>
+              <div class="model-title">WebLLM 模型</div>
+              <div class="model-desc">加载本地大语言模型，获取更细腻的回复</div>
+            </div>
+            ${isWebLlmSelected ? '<span class="model-badge">已选择</span>' : ''}
+          </div>
+          ${progressHtml}
+          <div class="model-status ${state.llm.ready ? 'ok' : ''}">${webLlmStatus}</div>
+          <div class="model-actions">
+            <button type="button" class="model-ghost" data-action="clear-webllm" ${state.llm.progress ? '' : 'disabled'}>清空 WebLLM 本地缓存</button>
+            <span class="model-hint">清空后可重新加载，提升设备空间</span>
+          </div>
+        </button>
+      </div>
+    </div>
+  `;
+
+  container.addEventListener('click', (event) => {
+    if (event.target === container) {
+      closeModelDialog();
+    }
+  });
+
+  container.querySelectorAll('.model-card').forEach(button => {
+    button.addEventListener('click', (event) => {
+      const model = event.currentTarget.getAttribute('data-model');
+      setModelMode(model);
+      closeModelDialog();
+    });
+  });
+
+  const clearButton = container.querySelector('[data-action="clear-webllm"]');
+  if (clearButton) {
+    clearButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      clearWebLlmCache();
+    });
+  }
+
+  const closeButton = container.querySelector('[data-action="close-model-dialog"]');
+  if (closeButton) {
+    closeButton.addEventListener('click', () => closeModelDialog());
+  }
+
+  modalRoot.appendChild(container);
+}
+
 function renderModals() {
   renderPasswordModal();
   renderCloudModal();
+  renderModelDialog();
 }
 
 function getStorageColor(usage) {
@@ -1408,6 +1514,10 @@ function renderMainView() {
     : state.llm.loading
       ? `WebLLM 正在加载模型... ${state.llm.progress}%`
       : '选择后开始加载 WebLLM，等待完成即可开始使用。';
+
+  const modeSummary = state.llm.mode === 'webllm'
+    ? '当前模式：WebLLM 模型'
+    : '当前模式：陪伴模式';
 
   const progressHtml = `
     <div class="model-progress">
@@ -1437,33 +1547,13 @@ function renderMainView() {
       <div class="tree-trunk" id="tree-trunk"></div>
       <div class="tree-content">
         <header class="tree-header">
-          <h1>树洞之树</h1>
-          <p>选择一个树洞，开始你的诉说</p>
-          <div class="model-selector">
-            <button class="model-card ${state.llm.mode === 'classic' ? 'active' : ''}" data-model="classic">
-              <div class="model-card-header">
-                <div>
-                  <div class="model-title">陪伴模式</div>
-                  <div class="model-desc">使用当前的温柔安慰逻辑快速回复</div>
-                </div>
-                ${state.llm.mode === 'classic' ? '<span class="model-badge">已选择</span>' : ''}
-              </div>
-            </button>
-            <button class="model-card ${state.llm.mode === 'webllm' ? 'active' : ''}" data-model="webllm">
-              <div class="model-card-header">
-                <div>
-                  <div class="model-title">WebLLM 模型</div>
-                  <div class="model-desc">加载本地大语言模型，获取更细腻的回复</div>
-                </div>
-                ${state.llm.mode === 'webllm' ? '<span class="model-badge">已选择</span>' : ''}
-              </div>
-              ${progressHtml}
-              <div class="model-status ${state.llm.ready ? 'ok' : ''}">${webLlmStatus}</div>
-              <div class="model-actions">
-                <button type="button" class="model-ghost" data-action="clear-webllm" ${state.llm.progress ? '' : 'disabled'}>清空 WebLLM 本地缓存</button>
-                <span class="model-hint">清空后可重新加载，提升设备空间</span>
-              </div>
-            </button>
+          <div class="header-top">
+            <div>
+              <h1>树洞之树</h1>
+              <p>选择一个树洞，开始你的诉说</p>
+              <div class="model-selection-note">${modeSummary}</div>
+            </div>
+            <button class="model-trigger" type="button" aria-label="选择陪伴模式" data-action="open-model-dialog">${modelIcon()}</button>
           </div>
         </header>
         <div style="position:relative; min-height: 180vh;">
@@ -1481,17 +1571,9 @@ function renderMainView() {
 
   scheduleTrunkHeightUpdate();
 
-  const modelButtons = document.querySelectorAll('.model-card');
-  modelButtons.forEach(button => {
-    button.addEventListener('click', (event) => {
-      const model = event.currentTarget.getAttribute('data-model');
-      setModelMode(model);
-    });
-  });
-
-  const clearButton = document.querySelector('[data-action="clear-webllm"]');
-  if (clearButton) {
-    clearButton.addEventListener('click', () => clearWebLlmCache());
+  const modelTrigger = document.querySelector('[data-action="open-model-dialog"]');
+  if (modelTrigger) {
+    modelTrigger.addEventListener('click', () => openModelDialog());
   }
 }
 
@@ -1987,6 +2069,15 @@ function render() {
     renderHistoryView();
   }
   renderModals();
+}
+
+function modelIcon() {
+  return `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="26" height="26">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 8a4.5 4.5 0 119 0c0 1.415-.424 2.305-1.06 3.06C14.57 12.784 12 15 12 17.5v1.5" />
+      <path stroke-linecap="round" stroke-linejoin="round" d="M9 21h6" />
+    </svg>
+  `;
 }
 
 function lockIcon() {
