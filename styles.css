@@ -777,6 +777,23 @@ body {
   color: var(--muted);
 }
 
+.history-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.badge-sender-user {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.badge-sender-ai {
+  background: #cffafe;
+  color: #0f766e;
+}
+
 .selection-bar {
   position: sticky;
   bottom: 0;
