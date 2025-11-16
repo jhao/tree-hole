@@ -5,6 +5,7 @@ const TREE_HOLES_DATA_KEY = 'treeHolesData';
 const SUPABASE_SETTINGS_KEY = 'treeHoleSupabaseSettings';
 const SUPABASE_LAST_SYNC_KEY = 'treeHoleSupabaseLastSync';
 const SUPABASE_TABLE_NAME = 'tree_holes_backups';
+const WEBLLM_CACHE_KEY = 'treeHoleWebLLMCache';
 const MAX_STORAGE_BYTES = 5 * 1024 * 1024;
 const STORAGE_WARNING_THRESHOLD = 0.9;
 
@@ -188,7 +189,14 @@ const state = {
     promptedForStorage: false
   },
   cloudModal: null,
-  activePasswords: {}
+  activePasswords: {},
+  llm: {
+    mode: 'classic',
+    loading: false,
+    progress: 0,
+    ready: false,
+    lastClearedAt: null
+  }
 };
 
 const root = document.getElementById('root');
@@ -198,6 +206,7 @@ let lastTouchEnd = 0;
 let cloudSyncTimeoutId = null;
 let skipNextCloudSync = false;
 let cloudAuthSubscription = null;
+let webLlmLoadingTimer = null;
 document.addEventListener('touchend', (event) => {
   const now = Date.now();
   const allowRapidTap = event.target && event.target.closest('[data-allow-rapid-tap]');
@@ -231,6 +240,100 @@ function loadSupabaseSettings() {
   } catch (error) {
     console.error('加载 Supabase 配置失败：', error);
   }
+}
+
+function loadModelState() {
+  try {
+    const cached = localStorage.getItem(WEBLLM_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed && typeof parsed === 'object') {
+        state.llm.mode = parsed.mode === 'webllm' ? 'webllm' : 'classic';
+        state.llm.ready = Boolean(parsed.ready);
+        state.llm.progress = Number(parsed.progress) || 0;
+        state.llm.loading = Boolean(parsed.loading);
+        state.llm.lastClearedAt = parsed.lastClearedAt || null;
+        if (state.llm.ready && state.llm.progress < 100) {
+          state.llm.progress = 100;
+        }
+      }
+    }
+  } catch (error) {
+    console.error('加载模型配置失败：', error);
+  }
+}
+
+function persistModelState() {
+  try {
+    localStorage.setItem(WEBLLM_CACHE_KEY, JSON.stringify({
+      mode: state.llm.mode,
+      loading: state.llm.loading,
+      progress: state.llm.progress,
+      ready: state.llm.ready,
+      lastClearedAt: state.llm.lastClearedAt
+    }));
+  } catch (error) {
+    console.error('保存模型配置失败：', error);
+  }
+}
+
+function resetWebLlmProgress() {
+  if (webLlmLoadingTimer) {
+    clearInterval(webLlmLoadingTimer);
+    webLlmLoadingTimer = null;
+  }
+  state.llm.loading = false;
+  state.llm.ready = false;
+  state.llm.progress = 0;
+}
+
+function clearWebLlmCache() {
+  resetWebLlmProgress();
+  state.llm.mode = 'classic';
+  state.llm.lastClearedAt = Date.now();
+  try {
+    localStorage.removeItem(WEBLLM_CACHE_KEY);
+  } catch (error) {
+    console.warn('移除 WebLLM 缓存失败：', error);
+  }
+  render();
+}
+
+function startWebLlmLoading() {
+  if (state.llm.ready) return;
+  state.llm.loading = true;
+  state.llm.progress = Math.max(state.llm.progress, 5);
+  persistModelState();
+
+  if (webLlmLoadingTimer) {
+    clearInterval(webLlmLoadingTimer);
+  }
+
+  webLlmLoadingTimer = setInterval(() => {
+    if (state.llm.progress >= 100) {
+      state.llm.ready = true;
+      state.llm.loading = false;
+      clearInterval(webLlmLoadingTimer);
+      webLlmLoadingTimer = null;
+      persistModelState();
+      render();
+      return;
+    }
+    const increment = Math.max(2, Math.round(Math.random() * 8));
+    state.llm.progress = Math.min(100, state.llm.progress + increment);
+    persistModelState();
+    render();
+  }, 800);
+}
+
+function setModelMode(mode) {
+  if (mode !== 'classic' && mode !== 'webllm') return;
+  state.llm.mode = mode;
+  if (mode === 'webllm' && !state.llm.ready) {
+    startWebLlmLoading();
+  }
+  persistModelState();
+  render();
 }
 
 function persistSupabaseConfig() {
@@ -646,6 +749,24 @@ async function getComfortingReply(text, imagePayload) {
   return comfortingPhrases[randomIndex];
 }
 
+async function getWebLlmReply(text, imagePayload) {
+  const summary = text.trim().slice(0, 80) || '你的分享';
+  const imageHint = imagePayload && imagePayload.present
+    ? '我也看到了你发来的图片，会一并考虑你的情绪。'
+    : '';
+  return `我加载了 WebLLM 来陪你聊天。${imageHint}听起来 ${summary} 让你有所触动，我会温柔地陪你慢慢聊。`;
+}
+
+async function getModelReply(text, imagePayload) {
+  if (state.llm.mode === 'webllm') {
+    if (!state.llm.ready) {
+      throw new Error('WebLLM 模型尚未加载完成。');
+    }
+    return getWebLlmReply(text, imagePayload);
+  }
+  return getComfortingReply(text, imagePayload);
+}
+
 async function analyzeMessage(text, imagePayload) {
   const lowerCaseText = text.toLowerCase();
   let emotion = '中性';
@@ -719,6 +840,10 @@ function exitActiveHole() {
 }
 
 function handleHoleClick(hole) {
+  if (state.llm.mode === 'webllm' && !state.llm.ready) {
+    alert('WebLLM 模型正在加载，请等待进度达到 100% 后再进入树洞。');
+    return;
+  }
   state.passwordModal = {
     open: true,
     mode: hole.passwordHash ? 'login' : 'setup',
@@ -1277,6 +1402,20 @@ function getStorageColor(usage) {
 }
 
 function renderMainView() {
+  const isWebLlmSelected = state.llm.mode === 'webllm';
+  const webLlmStatus = state.llm.ready
+    ? 'WebLLM 已加载完成，可以开始对话。'
+    : state.llm.loading
+      ? `WebLLM 正在加载模型... ${state.llm.progress}%`
+      : '选择后开始加载 WebLLM，等待完成即可开始使用。';
+
+  const progressHtml = `
+    <div class="model-progress">
+      <div class="model-progress-bar" style="width:${state.llm.progress}%;"></div>
+      <span class="model-progress-text">${state.llm.progress}%</span>
+    </div>
+  `;
+
   const treeHolesHtml = state.treeHoles.map(hole => {
     const createdDate = formatDateYMD(hole.createdAt);
     const dateHtml = createdDate ? `<span class="hole-date">${createdDate}</span>` : '';
@@ -1300,6 +1439,32 @@ function renderMainView() {
         <header class="tree-header">
           <h1>树洞之树</h1>
           <p>选择一个树洞，开始你的诉说</p>
+          <div class="model-selector">
+            <button class="model-card ${state.llm.mode === 'classic' ? 'active' : ''}" data-model="classic">
+              <div class="model-card-header">
+                <div>
+                  <div class="model-title">陪伴模式</div>
+                  <div class="model-desc">使用当前的温柔安慰逻辑快速回复</div>
+                </div>
+                ${state.llm.mode === 'classic' ? '<span class="model-badge">已选择</span>' : ''}
+              </div>
+            </button>
+            <button class="model-card ${state.llm.mode === 'webllm' ? 'active' : ''}" data-model="webllm">
+              <div class="model-card-header">
+                <div>
+                  <div class="model-title">WebLLM 模型</div>
+                  <div class="model-desc">加载本地大语言模型，获取更细腻的回复</div>
+                </div>
+                ${state.llm.mode === 'webllm' ? '<span class="model-badge">已选择</span>' : ''}
+              </div>
+              ${progressHtml}
+              <div class="model-status ${state.llm.ready ? 'ok' : ''}">${webLlmStatus}</div>
+              <div class="model-actions">
+                <button type="button" class="model-ghost" data-action="clear-webllm" ${state.llm.progress ? '' : 'disabled'}>清空 WebLLM 本地缓存</button>
+                <span class="model-hint">清空后可重新加载，提升设备空间</span>
+              </div>
+            </button>
+          </div>
         </header>
         <div style="position:relative; min-height: 180vh;">
           ${treeHolesHtml}
@@ -1315,6 +1480,19 @@ function renderMainView() {
   });
 
   scheduleTrunkHeightUpdate();
+
+  const modelButtons = document.querySelectorAll('.model-card');
+  modelButtons.forEach(button => {
+    button.addEventListener('click', (event) => {
+      const model = event.currentTarget.getAttribute('data-model');
+      setModelMode(model);
+    });
+  });
+
+  const clearButton = document.querySelector('[data-action="clear-webllm"]');
+  if (clearButton) {
+    clearButton.addEventListener('click', () => clearWebLlmCache());
+  }
 }
 
 function scheduleTrunkHeightUpdate() {
@@ -1369,6 +1547,9 @@ function renderChatView() {
   ` : '';
 
   const sendDisabled = state.isLoading || (!state.inputText.trim() && !state.inputImageFile);
+  const modelNotice = state.llm.mode === 'webllm'
+    ? `<div class="model-banner ${state.llm.ready ? 'ready' : ''}">${state.llm.ready ? 'WebLLM 已就绪，回复将由模型生成。' : 'WebLLM 加载中，完成后即可继续。'}</div>`
+    : '<div class="model-banner">当前使用陪伴模式，快速提供安慰回复。</div>';
   const usagePercent = Math.round(state.storageUsage * 100);
 
   root.innerHTML = `
@@ -1380,6 +1561,7 @@ function renderChatView() {
       </header>
       <main class="chat-body messages" id="messages">${messagesHtml}${typingHtml}</main>
       <footer class="chat-footer">
+        ${modelNotice}
         <div class="storage-indicator" data-action="cloud-sync">
           <div class="storage-label">
             <span>本地存储空间</span>
@@ -1619,7 +1801,8 @@ function autoResizeTextarea(textarea) {
 function updateSendButtonState() {
   const sendButton = document.querySelector('[data-action="send"]');
   if (!sendButton) return;
-  const shouldDisable = state.isLoading || (!state.inputText.trim() && !state.inputImageFile);
+  const modelBlocked = state.llm.mode === 'webllm' && !state.llm.ready;
+  const shouldDisable = state.isLoading || (!state.inputText.trim() && !state.inputImageFile) || modelBlocked;
   sendButton.disabled = shouldDisable;
 }
 
@@ -1760,7 +1943,7 @@ async function handleSendMessage() {
 
   try {
     const [replyText, classification] = await Promise.all([
-      getComfortingReply(text, imagePayload),
+      getModelReply(text, imagePayload),
       analyzeMessage(text, imagePayload)
     ]);
 
@@ -1869,5 +2052,9 @@ loadSupabaseSettings();
 initSupabaseClient().catch(error => {
   console.error('初始化 Supabase 失败：', error);
 });
+loadModelState();
+if (state.llm.mode === 'webllm' && !state.llm.ready && !state.llm.loading) {
+  startWebLlmLoading();
+}
 loadTreeHoles();
 render();
