@@ -773,9 +773,10 @@ async function getWebLlmReply(text, imagePayload) {
   const baseGreeting = greetingHit ? greetingResponses[Math.floor(Math.random() * greetingResponses.length)] : '';
   const imageLine = imagePayload?.present ? '看到了你分享的图片，想听听它背后的故事。' : '';
   const feelingLine = trimmed
-    ? `听起来这些话让你有所触动，我会用 WebLLM 认真回复。`
+    ? '听到了你的分享，我会认真回应。'
     : '我在这里，随时准备好听你说。';
-  return [baseGreeting, feelingLine, imageLine, '如果愿意，可以继续分享更多细节。']
+  const followUpLine = imagePayload?.present ? '想聊聊这张图片带给你的感觉吗？' : '';
+  return [baseGreeting, feelingLine, imageLine, followUpLine]
     .filter(Boolean)
     .join(' ');
 }
@@ -1669,8 +1670,8 @@ function renderChatView() {
 
   const sendDisabled = state.isLoading || (!state.inputText.trim() && !state.inputImageFile);
   const modelNotice = state.llm.mode === 'webllm'
-    ? `<div class="model-banner ${state.llm.ready ? 'ready' : ''}">${state.llm.ready ? 'WebLLM 已就绪，回复将由模型生成。' : 'WebLLM 加载中，完成后即可继续。'}</div>`
-    : '<div class="model-banner">当前使用陪伴模式，快速提供安慰回复。</div>';
+    ? `<div class="model-banner ${state.llm.ready ? 'ready' : ''}">${state.llm.ready ? '回复来自于 webllm' : 'WebLLM 加载中，完成后即可继续。'}</div>`
+    : '<div class="model-banner">回复来自于陪伴模式</div>';
   const usagePercent = Math.round(state.storageUsage * 100);
 
   root.innerHTML = `
