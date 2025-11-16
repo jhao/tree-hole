@@ -1,5 +1,6 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 import CryptoJS from 'https://cdn.jsdelivr.net/npm/crypto-js@4.2.0/+esm';
+import * as webllm from 'https://esm.run/@mlc-ai/web-llm?bundle';
 
 const TREE_HOLES_DATA_KEY = 'treeHolesData';
 const SUPABASE_SETTINGS_KEY = 'treeHoleSupabaseSettings';
@@ -8,6 +9,8 @@ const SUPABASE_TABLE_NAME = 'tree_holes_backups';
 const WEBLLM_CACHE_KEY = 'treeHoleWebLLMCache';
 const MAX_STORAGE_BYTES = 5 * 1024 * 1024;
 const STORAGE_WARNING_THRESHOLD = 0.9;
+const WEBLLM_MODEL_ID = 'Phi-3-mini-4k-instruct-q4f32_1-MLC';
+const WEBLLM_SYSTEM_PROMPT = '你是一位温柔的树洞守护者，以温暖、简短且有共情的中文回应用户的分享，避免重复提问，多用安抚性的语句。';
 
 const initialHolePositions = [
   { top: '14%', left: '50%' }, { top: '24%', left: '45%' }, { top: '30%', left: '55%' },
@@ -193,14 +196,17 @@ const state = {
   llm: {
     mode: 'webllm',
     loading: false,
-    progress: 100,
-    ready: true,
+    progress: 0,
+    ready: false,
     lastClearedAt: null,
-    lastInvocationAt: null
+    lastInvocationAt: null,
+    errorMessage: ''
   },
   autoScrollEnabled: true,
   modelDialogOpen: false
 };
+
+let webLlmEngine = null;
 
 const root = document.getElementById('root');
 const modalRoot = document.getElementById('modal-root');
@@ -252,14 +258,12 @@ function loadModelState() {
       const parsed = JSON.parse(cached);
       if (parsed && typeof parsed === 'object') {
         state.llm.mode = parsed.mode === 'webllm' ? 'webllm' : 'classic';
-        state.llm.ready = parsed.ready !== undefined ? Boolean(parsed.ready) : true;
-        state.llm.progress = Number(parsed.progress) || (state.llm.ready ? 100 : 0);
+        state.llm.ready = false;
+        state.llm.progress = Number(parsed.progress) || 0;
         state.llm.loading = Boolean(parsed.loading);
+        state.llm.errorMessage = typeof parsed.errorMessage === 'string' ? parsed.errorMessage : '';
         state.llm.lastClearedAt = parsed.lastClearedAt || null;
         state.llm.lastInvocationAt = parsed.lastInvocationAt || null;
-        if (state.llm.ready && state.llm.progress < 100) {
-          state.llm.progress = 100;
-        }
       }
     }
   } catch (error) {
@@ -274,6 +278,7 @@ function persistModelState() {
       loading: state.llm.loading,
       progress: state.llm.progress,
       ready: state.llm.ready,
+      errorMessage: state.llm.errorMessage,
       lastClearedAt: state.llm.lastClearedAt,
       lastInvocationAt: state.llm.lastInvocationAt
     }));
@@ -287,55 +292,82 @@ function resetWebLlmProgress() {
     clearInterval(webLlmLoadingTimer);
     webLlmLoadingTimer = null;
   }
+  webLlmEngine = null;
   state.llm.loading = false;
   state.llm.ready = false;
   state.llm.progress = 0;
+  state.llm.errorMessage = '';
 }
 
-function clearWebLlmCache() {
+async function clearWebLlmCache() {
   resetWebLlmProgress();
   state.llm.mode = 'classic';
   state.llm.lastClearedAt = Date.now();
+  try {
+    await webllm?.removeAllModelArtifacts?.();
+  } catch (error) {
+    console.warn('移除 WebLLM 远端缓存失败：', error);
+  }
   try {
     localStorage.removeItem(WEBLLM_CACHE_KEY);
   } catch (error) {
     console.warn('移除 WebLLM 缓存失败：', error);
   }
+  persistModelState();
   render();
 }
 
-function startWebLlmLoading() {
-  if (state.llm.ready) return;
-  state.llm.loading = true;
-  state.llm.progress = Math.max(state.llm.progress, 5);
-  persistModelState();
-
-  if (webLlmLoadingTimer) {
-    clearInterval(webLlmLoadingTimer);
+async function initializeWebLlm() {
+  if (state.llm.ready && webLlmEngine) {
+    return webLlmEngine;
+  }
+  if (state.llm.loading) {
+    return null;
   }
 
-  webLlmLoadingTimer = setInterval(() => {
-    if (state.llm.progress >= 100) {
-      state.llm.ready = true;
-      state.llm.loading = false;
-      clearInterval(webLlmLoadingTimer);
-      webLlmLoadingTimer = null;
-      persistModelState();
-      render();
-      return;
-    }
-    const increment = Math.max(2, Math.round(Math.random() * 8));
-    state.llm.progress = Math.min(100, state.llm.progress + increment);
+  state.llm.loading = true;
+  state.llm.ready = false;
+  state.llm.progress = 0;
+  state.llm.errorMessage = '';
+  persistModelState();
+  render();
+
+  try {
+    webLlmEngine = await webllm.CreateMLCEngine(WEBLLM_MODEL_ID, {
+      initProgressCallback: (progress) => {
+        const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
+        state.llm.progress = Math.round(Math.min(1, Math.max(0, ratio)) * 100);
+        state.llm.loading = state.llm.progress < 100;
+        persistModelState();
+        render();
+      }
+    });
+
+    state.llm.ready = true;
+    state.llm.loading = false;
+    state.llm.progress = 100;
     persistModelState();
+    return webLlmEngine;
+  } catch (error) {
+    console.error('加载 WebLLM 模型失败：', error);
+    state.llm.ready = false;
+    state.llm.loading = false;
+    state.llm.progress = 0;
+    state.llm.errorMessage = '加载 WebLLM 模型失败，请稍后重试。';
+    persistModelState();
+    return null;
+  } finally {
     render();
-  }, 800);
+  }
 }
 
 function setModelMode(mode) {
   if (mode !== 'classic' && mode !== 'webllm') return;
   state.llm.mode = mode;
-  if (mode === 'webllm' && !state.llm.ready) {
-    startWebLlmLoading();
+  if (mode === 'webllm') {
+    initializeWebLlm();
+  } else {
+    resetWebLlmProgress();
   }
   persistModelState();
   render();
@@ -351,14 +383,12 @@ function closeModelDialog() {
   renderModals();
 }
 
-function ensureWebLlmReadyForReply() {
-  if (state.llm.ready) {
-    return;
+async function ensureWebLlmReadyForReply() {
+  if (state.llm.ready && webLlmEngine) {
+    return true;
   }
-  state.llm.loading = false;
-  state.llm.ready = true;
-  state.llm.progress = 100;
-  persistModelState();
+  await initializeWebLlm();
+  return state.llm.ready && Boolean(webLlmEngine);
 }
 
 function persistSupabaseConfig() {
@@ -768,17 +798,29 @@ async function getComfortingReply(text, imagePayload) {
 async function getWebLlmReply(text, imagePayload) {
   state.llm.lastInvocationAt = Date.now();
   persistModelState();
-  const trimmed = text.trim();
-  const greetingHit = greetingKeywords.some(keyword => trimmed.toLowerCase().includes(keyword.toLowerCase()));
-  const baseGreeting = greetingHit ? greetingResponses[Math.floor(Math.random() * greetingResponses.length)] : '';
-  const imageLine = imagePayload?.present ? '看到了你分享的图片，想听听它背后的故事。' : '';
-  const feelingLine = trimmed
-    ? '听到了你的分享，我会认真回应。'
-    : '我在这里，随时准备好听你说。';
-  const followUpLine = imagePayload?.present ? '想聊聊这张图片带给你的感觉吗？' : '';
-  return [baseGreeting, feelingLine, imageLine, followUpLine]
-    .filter(Boolean)
-    .join(' ');
+  if (!webLlmEngine) {
+    throw new Error('WebLLM 尚未准备好');
+  }
+
+  const messages = [
+    { role: 'system', content: WEBLLM_SYSTEM_PROMPT },
+    {
+      role: 'user',
+      content: imagePayload?.present
+        ? `${text}\n\n另外，用户还上传了一张图片，请基于文字给予温柔、简短、共情的回复。`
+        : text || '请用温柔的语气回应用户刚才的分享。'
+    }
+  ];
+
+  const response = await webLlmEngine.chat.completions.create({
+    messages,
+    temperature: 0.7,
+    max_tokens: 200
+  });
+
+  const reply = response?.choices?.[0]?.message?.content?.trim();
+  if (reply) return reply;
+  return '我在认真听，请再和我分享一些细节。';
 }
 
 function buildCompanionReply(text, imagePayload) {
@@ -808,7 +850,10 @@ function buildCompanionReply(text, imagePayload) {
 
 async function getModelReply(text, imagePayload) {
   if (state.llm.mode === 'webllm') {
-    ensureWebLlmReadyForReply();
+    const ready = await ensureWebLlmReadyForReply();
+    if (!ready) {
+      throw new Error(state.llm.errorMessage || 'WebLLM 尚未准备好');
+    }
     return getWebLlmReply(text, imagePayload);
   }
   return buildCompanionReply(text, imagePayload);
@@ -889,7 +934,7 @@ function exitActiveHole() {
 
 function handleHoleClick(hole) {
   if (state.llm.mode === 'webllm' && !state.llm.ready) {
-    ensureWebLlmReadyForReply();
+    initializeWebLlm();
   }
   state.passwordModal = {
     open: true,
@@ -1447,11 +1492,13 @@ function renderModelDialog() {
   }
 
   const isWebLlmSelected = state.llm.mode === 'webllm';
-  const webLlmStatus = state.llm.ready
-    ? 'WebLLM 已加载完成，可以开始对话。'
-    : state.llm.loading
-      ? `WebLLM 正在加载模型... ${state.llm.progress}%`
-      : '选择后开始加载 WebLLM，等待完成即可开始使用。';
+  const webLlmStatus = state.llm.errorMessage
+    ? state.llm.errorMessage
+    : state.llm.ready
+      ? 'WebLLM 已加载完成，可以开始对话。'
+      : state.llm.loading
+        ? `WebLLM 正在加载模型... ${state.llm.progress}%`
+        : '选择后开始加载 WebLLM，等待完成即可开始使用。';
 
   const progressHtml = `
     <div class="model-progress">
@@ -1495,7 +1542,7 @@ function renderModelDialog() {
             ${isWebLlmSelected ? '<span class="model-badge">已选择</span>' : ''}
           </div>
           ${progressHtml}
-          <div class="model-status ${state.llm.ready ? 'ok' : ''}">${webLlmStatus}</div>
+          <div class="model-status ${state.llm.errorMessage ? 'error' : state.llm.ready ? 'ok' : ''}">${webLlmStatus}</div>
           <div class="model-actions">
             <button type="button" class="model-ghost" data-action="clear-webllm" ${state.llm.progress ? '' : 'disabled'}>清空 WebLLM 本地缓存</button>
             <span class="model-hint">清空后可重新加载，提升设备空间</span>
@@ -1549,11 +1596,13 @@ function getStorageColor(usage) {
 
 function renderMainView() {
   const isWebLlmSelected = state.llm.mode === 'webllm';
-  const webLlmStatus = state.llm.ready
-    ? 'WebLLM 已加载完成，可以开始对话。'
-    : state.llm.loading
-      ? `WebLLM 正在加载模型... ${state.llm.progress}%`
-      : '选择后开始加载 WebLLM，等待完成即可开始使用。';
+  const webLlmStatus = state.llm.errorMessage
+    ? state.llm.errorMessage
+    : state.llm.ready
+      ? 'WebLLM 已加载完成，可以开始对话。'
+      : state.llm.loading
+        ? `WebLLM 正在加载模型... ${state.llm.progress}%`
+        : '选择后开始加载 WebLLM，等待完成即可开始使用。';
 
   const modeSummary = state.llm.mode === 'webllm'
     ? '当前模式：WebLLM 模型'
@@ -1670,7 +1719,7 @@ function renderChatView() {
 
   const sendDisabled = state.isLoading || (!state.inputText.trim() && !state.inputImageFile);
   const modelNotice = state.llm.mode === 'webllm'
-    ? `<div class="model-banner ${state.llm.ready ? 'ready' : ''}">${state.llm.ready ? '回复来自于 webllm' : 'WebLLM 加载中，完成后即可继续。'}</div>`
+    ? `<div class="model-banner ${state.llm.ready ? 'ready' : ''}">${state.llm.errorMessage || (state.llm.ready ? '回复来自于 webllm' : 'WebLLM 加载中，完成后即可继续。')}</div>`
     : '<div class="model-banner">回复来自于陪伴模式</div>';
   const usagePercent = Math.round(state.storageUsage * 100);
 
@@ -2195,8 +2244,8 @@ initSupabaseClient().catch(error => {
   console.error('初始化 Supabase 失败：', error);
 });
 loadModelState();
-if (state.llm.mode === 'webllm' && !state.llm.ready && !state.llm.loading) {
-  startWebLlmLoading();
+if (state.llm.mode === 'webllm') {
+  initializeWebLlm();
 }
 loadTreeHoles();
 render();
