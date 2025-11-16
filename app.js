@@ -2116,6 +2116,8 @@ async function handleSendMessage() {
   hole.messages.push(userMessage);
   saveTreeHoles();
 
+  // 发送后强制自动滚动到底部，确保最新消息可见
+  state.autoScrollEnabled = true;
   state.inputText = '';
   state.inputImageFile = null;
   ensurePreviewRevoked();
@@ -2156,6 +2158,8 @@ async function handleSendMessage() {
     saveTreeHoles();
   }
 
+  // 确保生成回复后也自动滚动到最新位置
+  state.autoScrollEnabled = true;
   state.isLoading = false;
   render();
 }
