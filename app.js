@@ -1776,12 +1776,18 @@ function renderHistoryView() {
           : message.classification?.emotion === '悲伤'
             ? 'badge-emotion-sad'
             : 'badge-emotion-neutral';
-        const badges = message.classification ? `
-          <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
-            <span class="badge ${emotionClass}">${message.classification.emotion}</span>
-            <span class="badge badge-type">${message.classification.content_type}</span>
-          </div>
+        const senderBadgeClass = message.sender === 'ai' ? 'badge-sender-ai' : 'badge-sender-user';
+        const roleBadge = `<span class="badge ${senderBadgeClass}">${message.senderLabel}</span>`;
+        const classificationBadges = message.classification ? `
+          <span class="badge ${emotionClass}">${message.classification.emotion}</span>
+          <span class="badge badge-type">${message.classification.content_type}</span>
         ` : '';
+        const badges = `
+          <div class="history-badges">
+            ${roleBadge}
+            ${classificationBadges}
+          </div>
+        `;
         return `
           <label class="history-item">
             <input type="checkbox" data-message-id="${message.id}" ${checked} style="margin-top:6px;" />
@@ -1845,13 +1851,13 @@ function renderHistoryView() {
 
 function getFilteredMessages(hole) {
   return hole.messages
-    .filter(message => message.sender === 'user')
     .map(message => {
       const { text, imageUrl } = getDecryptedMessageContent(hole, message);
       return {
         ...message,
         decryptedText: text,
-        decryptedImageUrl: imageUrl
+        decryptedImageUrl: imageUrl,
+        senderLabel: message.sender === 'ai' ? '电脑' : '用户'
       };
     })
     .filter(message => {
@@ -1865,11 +1871,26 @@ function getFilteredMessages(hole) {
 }
 
 function scrollMessagesToBottom() {
-  requestAnimationFrame(() => {
-    const messagesContainer = document.getElementById('messages');
-    if (messagesContainer && (state.autoScrollEnabled || state.pendingScrollToBottom)) {
+  const messagesContainer = document.getElementById('messages');
+  if (!messagesContainer) return;
+
+  const performScroll = () => {
+    if (state.autoScrollEnabled || state.pendingScrollToBottom) {
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
       state.pendingScrollToBottom = false;
+    }
+  };
+
+  requestAnimationFrame(performScroll);
+
+  messagesContainer.querySelectorAll('img').forEach(img => {
+    if (img.dataset.scrollListenerAttached) return;
+    img.dataset.scrollListenerAttached = 'true';
+    if (!img.complete && state.autoScrollEnabled) {
+      img.addEventListener('load', () => {
+        state.pendingScrollToBottom = true;
+        scrollMessagesToBottom();
+      }, { once: true });
     }
   });
 }
@@ -1995,6 +2016,8 @@ function attachHistoryEvents(filteredMessages) {
   if (backButton) {
     backButton.addEventListener('click', () => {
       state.activeView = 'chat';
+      state.autoScrollEnabled = true;
+      state.pendingScrollToBottom = true;
       render();
     });
   }
