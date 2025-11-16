@@ -203,6 +203,7 @@ const state = {
     errorMessage: ''
   },
   autoScrollEnabled: true,
+  pendingScrollToBottom: false,
   modelDialogOpen: false
 };
 
@@ -909,6 +910,7 @@ function setActiveHole(holeId) {
   state.contentTypeFilter = 'all';
   state.isLoading = false;
   state.autoScrollEnabled = true;
+  state.pendingScrollToBottom = true;
   ensurePreviewRevoked();
   state.inputText = '';
   state.inputImageFile = null;
@@ -1865,8 +1867,9 @@ function getFilteredMessages(hole) {
 function scrollMessagesToBottom() {
   requestAnimationFrame(() => {
     const messagesContainer = document.getElementById('messages');
-    if (messagesContainer && state.autoScrollEnabled) {
+    if (messagesContainer && (state.autoScrollEnabled || state.pendingScrollToBottom)) {
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      state.pendingScrollToBottom = false;
     }
   });
 }
@@ -2118,6 +2121,7 @@ async function handleSendMessage() {
 
   // 发送后强制自动滚动到底部，确保最新消息可见
   state.autoScrollEnabled = true;
+  state.pendingScrollToBottom = true;
   state.inputText = '';
   state.inputImageFile = null;
   ensurePreviewRevoked();
@@ -2160,6 +2164,7 @@ async function handleSendMessage() {
 
   // 确保生成回复后也自动滚动到最新位置
   state.autoScrollEnabled = true;
+  state.pendingScrollToBottom = true;
   state.isLoading = false;
   render();
 }
