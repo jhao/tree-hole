@@ -218,6 +218,10 @@ body {
   color: #bef264;
 }
 
+.model-status.error {
+  color: #fca5a5;
+}
+
 .model-actions {
   margin-top: 12px;
   display: flex;
