@@ -198,6 +198,7 @@ const state = {
     lastClearedAt: null,
     lastInvocationAt: null
   },
+  autoScrollEnabled: true,
   modelDialogOpen: false
 };
 
@@ -767,12 +768,49 @@ async function getComfortingReply(text, imagePayload) {
 async function getWebLlmReply(text, imagePayload) {
   state.llm.lastInvocationAt = Date.now();
   persistModelState();
-  return '我加载了 WebLLM 来陪你聊天。听起来 今天如何 让你有所触动，我会温柔地陪你慢慢聊。';
+  const trimmed = text.trim();
+  const greetingHit = greetingKeywords.some(keyword => trimmed.toLowerCase().includes(keyword.toLowerCase()));
+  const baseGreeting = greetingHit ? greetingResponses[Math.floor(Math.random() * greetingResponses.length)] : '';
+  const imageLine = imagePayload?.present ? '看到了你分享的图片，想听听它背后的故事。' : '';
+  const feelingLine = trimmed
+    ? `听起来这些话让你有所触动，我会用 WebLLM 认真回复。`
+    : '我在这里，随时准备好听你说。';
+  return [baseGreeting, feelingLine, imageLine, '如果愿意，可以继续分享更多细节。']
+    .filter(Boolean)
+    .join(' ');
+}
+
+function buildCompanionReply(text, imagePayload) {
+  const normalized = text.trim();
+  const lowerCase = normalized.toLowerCase();
+  const greetingHit = greetingKeywords.some(keyword => lowerCase.includes(keyword.toLowerCase()));
+  if (greetingHit) {
+    return `${greetingResponses[Math.floor(Math.random() * greetingResponses.length)]} 我在陪伴模式下倾听你。`;
+  }
+
+  const comfort = comfortingPhrases[Math.floor(Math.random() * comfortingPhrases.length)];
+  if (!normalized && imagePayload?.present) {
+    return '看到了你的分享，这张图片背后有什么故事吗？';
+  }
+
+  const emotionEntry = Object.entries(emotionKeywords).find(([, keywords]) =>
+    keywords.some(keyword => lowerCase.includes(keyword))
+  );
+
+  if (emotionEntry) {
+    const [emotion] = emotionEntry;
+    return `感受到你现在有些${emotion}，${comfort}`;
+  }
+
+  return `${comfort} 如果愿意，多告诉我一些细节，我会一直听着。`;
 }
 
 async function getModelReply(text, imagePayload) {
-  ensureWebLlmReadyForReply();
-  return getWebLlmReply(text, imagePayload);
+  if (state.llm.mode === 'webllm') {
+    ensureWebLlmReadyForReply();
+    return getWebLlmReply(text, imagePayload);
+  }
+  return buildCompanionReply(text, imagePayload);
 }
 
 async function analyzeMessage(text, imagePayload) {
@@ -824,6 +862,7 @@ function setActiveHole(holeId) {
   state.emotionFilter = 'all';
   state.contentTypeFilter = 'all';
   state.isLoading = false;
+  state.autoScrollEnabled = true;
   ensurePreviewRevoked();
   state.inputText = '';
   state.inputImageFile = null;
@@ -1776,7 +1815,7 @@ function getFilteredMessages(hole) {
 function scrollMessagesToBottom() {
   requestAnimationFrame(() => {
     const messagesContainer = document.getElementById('messages');
-    if (messagesContainer) {
+    if (messagesContainer && state.autoScrollEnabled) {
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
   });
@@ -1870,6 +1909,16 @@ function attachChatEvents() {
   const sendButton = document.querySelector('[data-action="send"]');
   if (sendButton) {
     sendButton.addEventListener('click', () => handleSendMessage());
+  }
+
+  const messagesContainer = document.getElementById('messages');
+  if (messagesContainer) {
+    messagesContainer.addEventListener('scroll', () => {
+      const distanceFromBottom = messagesContainer.scrollHeight - messagesContainer.clientHeight - messagesContainer.scrollTop;
+      if (distanceFromBottom > 60 && state.autoScrollEnabled) {
+        state.autoScrollEnabled = false;
+      }
+    });
   }
 
   updateSendButtonState();
@@ -1982,6 +2031,7 @@ async function handleSendMessage() {
     return;
   }
 
+  state.autoScrollEnabled = true;
   state.isLoading = true;
   render();
 
