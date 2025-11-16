@@ -1,6 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 import CryptoJS from 'https://cdn.jsdelivr.net/npm/crypto-js@4.2.0/+esm';
-import * as webllm from 'https://esm.run/@mlc-ai/web-llm?bundle';
 
 const TREE_HOLES_DATA_KEY = 'treeHolesData';
 const SUPABASE_SETTINGS_KEY = 'treeHoleSupabaseSettings';
@@ -194,7 +193,7 @@ const state = {
   cloudModal: null,
   activePasswords: {},
   llm: {
-    mode: 'webllm',
+    mode: 'classic',
     loading: false,
     progress: 0,
     ready: false,
@@ -208,6 +207,7 @@ const state = {
 };
 
 let webLlmEngine = null;
+let webllmModule = null;
 
 const root = document.getElementById('root');
 const modalRoot = document.getElementById('modal-root');
@@ -300,12 +300,33 @@ function resetWebLlmProgress() {
   state.llm.errorMessage = '';
 }
 
+async function loadWebLlmModule() {
+  if (webllmModule) {
+    return webllmModule;
+  }
+
+  try {
+    webllmModule = await import('https://esm.run/@mlc-ai/web-llm?bundle');
+    return webllmModule;
+  } catch (error) {
+    console.error('加载 WebLLM 组件失败：', error);
+    state.llm.errorMessage = '加载 WebLLM 组件失败，请检查网络后重试。';
+    state.llm.loading = false;
+    state.llm.progress = 0;
+    persistModelState();
+    render();
+    throw error;
+  }
+}
+
 async function clearWebLlmCache() {
   resetWebLlmProgress();
   state.llm.mode = 'classic';
   state.llm.lastClearedAt = Date.now();
   try {
-    await webllm?.removeAllModelArtifacts?.();
+    if (webllmModule) {
+      await webllmModule.removeAllModelArtifacts?.();
+    }
   } catch (error) {
     console.warn('移除 WebLLM 远端缓存失败：', error);
   }
@@ -334,6 +355,7 @@ async function initializeWebLlm() {
   render();
 
   try {
+    const webllm = await loadWebLlmModule();
     webLlmEngine = await webllm.CreateMLCEngine(WEBLLM_MODEL_ID, {
       initProgressCallback: (progress) => {
         const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
